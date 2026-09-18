@@ -25,6 +25,9 @@ type OpenAiChunk = {
 		prompt_cache_miss_tokens?: number;
 		prompt_tokens_details?: { cached_tokens?: number };
 	} | null;
+	// Some relays/gateways report upstream failures as a 200 stream whose
+	// payload is a bare {"error": {...}} object instead of a proper HTTP error.
+	error?: { message?: string; type?: string; code?: string | number } | string | null;
 };
 
 async function toOpenAiMessages(context: Context): Promise<unknown[]> {
@@ -208,6 +211,19 @@ async function runStream(
 					chunk = JSON.parse(data);
 				} catch {
 					continue;
+				}
+				// A 200 stream may carry an upstream failure as its first (and
+				// only) payload: a bare `{"error": {...}}` with no `choices`.
+				// Without this check the error is silently dropped by the
+				// `if (!choice) continue;` branch below and surfaces later as a
+				// misleading "empty completion" error.
+				if (chunk && typeof chunk === "object" && chunk.error) {
+					const raw = chunk.error;
+					const msg =
+						typeof raw === "string"
+							? raw
+							: raw.message ?? JSON.stringify(raw);
+					throw new Error(`Provider error: ${String(msg).slice(0, 500)}`);
 				}
 				// Usage can arrive in a dedicated final chunk (empty `choices`) or
 				// alongside the last choice, so it is read before branching on
