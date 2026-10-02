@@ -75,6 +75,7 @@ export const VIEW_HTML = `<!DOCTYPE html>
       <section class="composer">
         <div class="chat-box">
           <div class="attach-strip" id="attach-strip" hidden></div>
+          <div class="steer-strip" id="steer-strip" hidden></div>
           <textarea id="input" rows="3" placeholder="输入消息，按 Ctrl/Cmd+Enter 发送..."></textarea>
           <input type="file" id="attach-file" accept="image/*" multiple hidden />
           <div class="effort-bar">
@@ -89,6 +90,9 @@ export const VIEW_HTML = `<!DOCTYPE html>
               <button class="effort-opt" data-effort="max" title="max：开启思考模式，强度 max">max</button>
             </div>
           </div>
+          <button id="steer-btn" class="steer-btn" title="注入引导（Enter）" type="button" hidden>
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M2 8H10.5M10.5 8L7 4.5M10.5 8L7 11.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/><path d="M13.5 3V13" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+          </button>
           <button id="send" class="send-btn" title="发送">
             <svg class="icon-send" width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M8 13V3M4.5 6.5L8 3L11.5 6.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
             <svg class="icon-stop" width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M3 3H13V13H3Z" fill="currentColor"/></svg>
@@ -453,6 +457,15 @@ li { margin: 4px 0; }
 .chat-box .send-btn.stop:hover { background: var(--err); }
 .chat-box .send-btn.stop .icon-send { display: none; }
 .chat-box .send-btn.stop .icon-stop { display: block; }
+.chat-box .steer-btn {
+  position: absolute; right: 50px; bottom: 12px;
+  width: 32px; height: 32px; border: 0; border-radius: 50%; cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  background: var(--accent-soft); color: var(--accent);
+  transition: background .15s ease, color .15s ease;
+}
+.chat-box .steer-btn:hover { background: var(--accent); color: #fff; }
+.chat-box .steer-btn svg { display: block; }
 .effort-bar { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
 .attach-btn {
   display: inline-flex; align-items: center; justify-content: center;
@@ -486,6 +499,22 @@ li { margin: 4px 0; }
 }
 .attach-chip .attach-x:hover { background: var(--err); }
 .attach-count { font-size: 11px; color: var(--faint); user-select: none; }
+.steer-strip { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+.steer-chip {
+  display: inline-flex; align-items: center; gap: 6px; min-width: 0;
+  padding: 3px 10px; border-radius: 999px;
+  background: var(--accent-soft); color: var(--accent);
+  border: 1px solid var(--accent); font-size: 12px;
+}
+.steer-chip .steer-spin {
+  flex: none; width: 10px; height: 10px;
+  border: 2px solid currentColor; border-top-color: transparent;
+  border-radius: 50%; animation: steer-spin .8s linear infinite;
+}
+@keyframes steer-spin { to { transform: rotate(360deg); } }
+.steer-chip .steer-text {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 340px;
+}
 .effort-label { font-size: 11px; color: var(--faint); user-select: none; }
 .effort-seg {
   display: inline-flex; gap: 2px; padding: 2px;
@@ -749,6 +778,8 @@ export const APP_JS = `"use strict";
 var conversation = document.getElementById("conversation");
 var convInner = document.getElementById("conv-inner");
 var sendBtn = document.getElementById("send");
+var steerBtn = document.getElementById("steer-btn");
+var steerStrip = document.getElementById("steer-strip");
 var statusDot = document.getElementById("status");
 var modelLabel = document.getElementById("model-label");
 var modelInput = document.getElementById("model-input");
@@ -1669,6 +1700,7 @@ function setStatus(mode) {
   statusDot.className = "dot " + mode;
   progressEl.hidden = mode !== "busy";
   isBusy = mode === "busy";
+  applySendMode();
   updateSendState();
 }
 
@@ -2030,6 +2062,7 @@ function handleLiveEvent(e) {
       scheduleSave();
       saveTraj(liveWs);
       if (liveWs.metaEl) liveWs.metaEl.textContent = "已完成";
+      clearSteerChips();
       loadRuns();
       break;
     case "message_start": {
@@ -2168,6 +2201,9 @@ case "message_update":
       break;
     case "turn_start":
       if (liveWs.turnFromUserPrompt) { liveWs.turnFromUserPrompt = false; } else { createTurn(liveWs); }
+      // The server drains the steering queue right after turn_start, so any
+      // chip still showing has just been delivered.
+      clearSteerChips();
       break;
     case "turn_end":
       endTurn(liveWs);
@@ -2241,9 +2277,13 @@ var enterToSend = false;
 try { enterToSend = localStorage.getItem("tju.gui.enterSend") === "1"; } catch (e) {}
 function applySendMode() {
   optEnterSend.checked = enterToSend;
-  ta.placeholder = enterToSend
-    ? "输入消息，按 Enter 发送，Shift+Enter 换行..."
-    : "输入消息，按 Ctrl/Cmd+Enter 发送...";
+  if (isBusy) {
+    ta.placeholder = "补充引导：Enter 注入（AI 将在下一步收到），Shift+Enter 换行...";
+  } else {
+    ta.placeholder = enterToSend
+      ? "输入消息，按 Enter 发送，Shift+Enter 换行..."
+      : "输入消息，按 Ctrl/Cmd+Enter 发送...";
+  }
 }
 function openSettings() {
   applySendMode();
@@ -2386,12 +2426,87 @@ function uploadPendingAttachments() {
   });
 }
 
+// ---- steering (mid-run guidance) ----
+// Chips shown while a steer is queued but not yet consumed. They are cleared
+// on turn_start, which is exactly when the server drains the steering queue.
+var steerChips = [];
+
+function addSteerChip(text) {
+  var el = document.createElement("div");
+  el.className = "steer-chip";
+  var spin = document.createElement("span");
+  spin.className = "steer-spin";
+  var label = document.createElement("span");
+  label.className = "steer-text";
+  label.textContent = text;
+  label.title = text;
+  el.appendChild(spin);
+  el.appendChild(label);
+  steerStrip.appendChild(el);
+  steerStrip.hidden = false;
+  steerChips.push(el);
+  return el;
+}
+
+function removeSteerChip(el) {
+  if (!el) return;
+  var i = steerChips.indexOf(el);
+  if (i >= 0) steerChips.splice(i, 1);
+  el.remove();
+  if (!steerChips.length) steerStrip.hidden = true;
+}
+
+function clearSteerChips() {
+  steerChips = [];
+  steerStrip.replaceChildren();
+  steerStrip.hidden = true;
+}
+
+// Inject the composer's text into the running agent. The server routes a
+// /api/send while streaming to agent.steer(), which lands in the next turn.
+function steer() {
+  if (!isBusy) return;
+  var text = ta.value.trim();
+  if (!text) return;
+  ta.value = "";
+  updateSendState();
+  var chip = addSteerChip(text);
+  fetch("/api/send", {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-agent-token": AGENT_TOKEN },
+    body: JSON.stringify({ text: text })
+  })
+    .then(function (r) { return r.json(); })
+    .then(function (r) {
+      if (r && r.error) {
+        removeSteerChip(chip);
+        bubble("error", r.error);
+        ta.value = text;
+        updateSendState();
+        return;
+      }
+      // The queued flag is false when the run ended between the keypress and
+      // the request: the server treated it as a fresh prompt, so the chip has
+      // nothing left to wait for.
+      if (!r || !r.queued) removeSteerChip(chip);
+    })
+    .catch(function (err) {
+      removeSteerChip(chip);
+      bubble("error", "引导发送失败：" + String((err && err.message) || err));
+      ta.value = text;
+      updateSendState();
+    });
+}
+
+steerBtn.addEventListener("click", steer);
+
 function updateSendState() {
   var hasText = ta.value.trim().length > 0;
   var hasAttach = pendingAttachments.length > 0;
   sendBtn.classList.toggle("can-send", !isBusy && (hasText || hasAttach));
   sendBtn.classList.toggle("stop", isBusy);
   sendBtn.title = isBusy ? "停止回答" : "发送";
+  if (steerBtn) steerBtn.hidden = !(isBusy && hasText);
 }
 
 function clearPendingAttachments() {
@@ -2407,6 +2522,10 @@ function send() {
     fetch("/api/abort", { method: "POST", headers: { "x-agent-token": AGENT_TOKEN } });
     return;
   }
+  sendMessage();
+}
+
+function sendMessage() {
   var text = ta.value.trim();
   if (!text && !pendingAttachments.length) return;
   sendBtn.disabled = true;
@@ -2460,10 +2579,14 @@ ta.addEventListener("keydown", function (ev) {
   if (ev.key !== "Enter") return;
   if (ev.isComposing || ev.keyCode === 229) return;
   var mod = ev.ctrlKey || ev.metaKey;
-  var shouldSend = mod || (enterToSend && !ev.shiftKey);
+  // While a run is active, plain Enter injects steering: correcting the agent
+  // mid-flight should be the fast path, not a chord. Shift+Enter still breaks
+  // the line, and the main button stays a stop button.
+  var shouldSend = isBusy ? !ev.shiftKey : (mod || (enterToSend && !ev.shiftKey));
   if (!shouldSend) return;
   ev.preventDefault();
-  if (!isBusy) send();
+  if (isBusy) steer();
+  else send();
 });
 document.getElementById("btn-clear").addEventListener("click", function () {
   fetch("/api/clear", { method: "POST", headers: { "x-agent-token": AGENT_TOKEN } }).then(function () {

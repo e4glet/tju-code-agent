@@ -247,6 +247,11 @@ export class Agent {
 				return result ?? messages;
 			},
 			getSteeringMessages: async () => this.steeringQueue.splice(0),
+			// Drain steering again when the model is about to stop (no tool calls
+			// this turn): otherwise a steer that arrives while the final turn is
+			// streaming would sit in the queue until the *next* user prompt, which
+			// defeats the point of mid-flight correction.
+			getFollowUpMessages: async () => this.steeringQueue.splice(0),
 		};
 	}
 
