@@ -73,6 +73,7 @@ export const VIEW_HTML = `<!DOCTYPE html>
         </div>
       </section>
       <section class="composer">
+        <div class="todo-dock" id="todo-dock" hidden></div>
         <div class="chat-box">
           <div class="attach-strip" id="attach-strip" hidden></div>
           <div class="steer-strip" id="steer-strip" hidden></div>
@@ -99,6 +100,13 @@ export const VIEW_HTML = `<!DOCTYPE html>
           </button>
         </div>
       </section>
+      <div class="user-nav" id="user-nav" hidden>
+        <div class="user-nav-scroll" id="user-nav-scroll">
+          <div class="user-nav-clip" id="user-nav-clip">
+            <div class="user-nav-list" id="user-nav-list"></div>
+          </div>
+        </div>
+      </div>
       <div class="scroll-col">
         <button id="btn-scroll-bottom" class="scroll-bottom" title="回到最新位置" hidden>
           <svg width="14" height="14" viewBox="0 0 14 14" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M11.8486 5.5L11.4238 5.92383L8.69727 8.65137C8.44157 8.90706 8.21562 9.13382 8.01172 9.29785C7.79912 9.46883 7.55595 9.61756 7.25 9.66602C7.08435 9.69222 6.91565 9.69222 6.75 9.66602C6.44405 9.61756 6.20088 9.46883 5.98828 9.29785C5.78438 9.13382 5.55843 8.90706 5.30273 8.65137L2.57617 5.92383L2.15137 5.5L3 4.65137L3.42383 5.07617L6.15137 7.80273C6.42595 8.07732 6.59876 8.24849 6.74023 8.3623C6.87291 8.46904 6.92272 8.47813 6.9375 8.48047C6.97895 8.48703 7.02105 8.48703 7.0625 8.48047C7.07728 8.47813 7.12709 8.46904 7.25977 8.3623C7.40124 8.24849 7.57405 8.07732 7.84863 7.80273L10.5762 5.07617L11 4.65137L11.8486 5.5Z" fill="currentColor"></path></svg>
@@ -182,6 +190,7 @@ export const STYLE_CSS = `:root {
   --text: #1b1b1c; --muted: #6b7076; --faint: #9aa0a8;
   --accent: #4176e6; --accent-hover: #2f66e0; --accent-soft: rgba(65, 118, 230, 0.09);
   --user-bubble: #edf3fe; --err: #e5484d; --ok: #22a06b; --warn: #d9822b;
+  --nav-bar: rgba(15, 17, 21, 0.22);
   --shadow: 0 4px 12px 0 rgba(0, 0, 0, 0.02), 0 2px 8px 0 rgba(0, 0, 0, 0.05);
 }
 html { color-scheme: light; }
@@ -191,6 +200,7 @@ html[data-theme="dark"] {
   --text: #e8e8ea; --muted: #a0a4aa; --faint: #7c8087;
   --accent: #679efe; --accent-hover: #86acff; --accent-soft: rgba(103, 158, 254, 0.16);
   --user-bubble: #2c2c2e; --err: #f07178; --ok: #4ecb8d; --warn: #e0a458;
+  --nav-bar: rgba(255, 255, 255, 0.3);
   --shadow: 0 4px 16px 0 rgba(0, 0, 0, 0.42), 0 2px 8px 0 rgba(0, 0, 0, 0.26);
   color-scheme: dark;
 }
@@ -383,6 +393,7 @@ li { margin: 4px 0; }
 .bubble.error .body { padding: 8px 12px; }
 .bubble .body { min-width: 0; }
 .bubble.user .attachments { display: flex; flex-wrap: wrap; gap: 8px; padding: 8px 14px 0; }
+.copy.user-copy { align-self: flex-end; margin: 4px 0 0 0; }
 .bubble .att-img {
   max-width: 220px; max-height: 220px; border-radius: 10px; cursor: zoom-in;
   border: 1px solid var(--border); object-fit: contain;
@@ -427,6 +438,46 @@ li { margin: 4px 0; }
 .badge.running { background: var(--accent); }
 .badge.ok { background: var(--ok); }
 .badge.err { background: var(--err); }
+.todo-card {
+  background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+  overflow: hidden; font-size: 13px;
+}
+.todo-card.live {
+  border-color: var(--accent); box-shadow: var(--shadow);
+}
+.todo-dock { max-width: 788px; margin: 0 auto 8px; }
+.todo-dock .todo-list { max-height: 28vh; overflow-y: auto; }
+.todo-head {
+  display: flex; align-items: center; gap: 8px;
+  padding: 9px 12px; cursor: pointer; user-select: none; font-weight: 600;
+}
+.todo-head .caret { color: var(--faint); transition: transform .15s ease; }
+.todo-card:not(.collapsed) .todo-head .caret { transform: rotate(90deg); }
+.todo-badge {
+  flex: none; font-size: 11px; border-radius: 999px; padding: 1px 8px; color: #fff;
+}
+.todo-badge.running { background: var(--accent); }
+.todo-badge.ok { background: var(--ok); }
+.todo-count {
+  margin-left: auto; font-size: 12px; color: var(--muted); font-weight: 500;
+  font-family: "SF Mono", "JetBrains Mono", "Fira Code", Consolas, monospace;
+}
+.todo-body { padding: 2px 0 4px; }
+.todo-card.collapsed .todo-body { display: none; }
+.todo-bar { height: 4px; margin: 0 12px 8px; background: var(--code); border-radius: 2px; overflow: hidden; }
+.todo-bar > i { display: block; height: 100%; width: 0; background: var(--accent); border-radius: 2px; transition: width .3s ease; }
+.todo-list { list-style: none; margin: 0; padding: 0 12px 10px; display: flex; flex-direction: column; gap: 6px; }
+.todo-list li { display: flex; align-items: baseline; gap: 8px; line-height: 1.5; }
+.todo-mark { flex: none; width: 16px; text-align: center; }
+.todo-done .todo-mark { color: var(--ok); }
+.todo-active .todo-mark { color: var(--accent); }
+.todo-pending .todo-mark { color: var(--faint); }
+.todo-done .todo-text { color: var(--muted); text-decoration: line-through; }
+.todo-text { flex: 1; min-width: 0; }
+.todo-pri {
+  flex: none; font-size: 11px; color: var(--faint);
+  border: 1px solid var(--border); border-radius: 999px; padding: 0 7px;
+}
 .cursor { display: inline-block; width: 2px; height: 1em; background: var(--accent); vertical-align: text-bottom; margin-left: 2px; animation: blink 0.9s infinite; }
 @keyframes blink { 50% { opacity: 0; } }
 .composer { flex-shrink: 0; padding: 6px 20px 18px; }
@@ -534,6 +585,53 @@ li { margin: 4px 0; }
   max-width: 788px; display: flex; justify-content: flex-end;
   pointer-events: none; z-index: 3;
 }
+.user-nav {
+  position: absolute; top: 50%; right: 10px; z-index: 4;
+  transform: translateY(-50%);
+  background: transparent; border: 1px solid transparent; border-radius: 14px;
+  overflow: hidden; cursor: pointer;
+  transition: width .22s ease, background .22s ease, border-color .22s ease, box-shadow .22s ease;
+}
+.user-nav.open {
+  background: var(--panel); border-color: var(--border);
+  box-shadow: var(--shadow);
+}
+.user-nav-scroll { overflow: hidden; padding: 10px 0; box-sizing: content-box; }
+.user-nav.open .user-nav-scroll { overflow-y: auto; }
+.user-nav.open .user-nav-scroll::-webkit-scrollbar { width: 6px; }
+.user-nav-clip {
+  position: relative; width: 100%; min-height: 30px;
+}
+.user-nav-item {
+  position: absolute; left: 0; right: 0; height: 30px;
+  display: flex; align-items: center;
+  padding: 6px 8px 6px 16px;
+  color: var(--muted); font-size: 13px; line-height: 1.3;
+  box-sizing: border-box; user-select: none; cursor: pointer;
+  transition: color .15s ease, padding .15s ease;
+}
+.user-nav.open .user-nav-item { padding: 6px 34px 6px 16px; }
+.user-nav-item:hover { color: var(--text); }
+.user-nav-text {
+  flex: 0 1 auto; min-width: 0; max-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  opacity: 0;
+  transition: opacity .18s ease, max-width .22s ease;
+}
+.user-nav.open .user-nav-text { opacity: 1; max-width: 230px; }
+.user-nav-item::after {
+  content: ""; position: absolute; right: 6px; top: 50%; z-index: 1;
+  width: 12px; height: 3px; margin-top: -1.5px;
+  border-radius: 2px; background: var(--nav-bar);
+  transition: width .15s ease, height .15s ease, margin .15s ease, background .15s ease;
+}
+.user-nav-item:hover::after { background: var(--muted); }
+.user-nav-item.active { color: var(--accent); }
+.user-nav-item.active::after {
+  width: 24px; height: 4px; margin-top: -2px;
+  background: var(--accent);
+}
+.user-nav.open .user-nav-item.active { font-weight: 600; }
 .scroll-bottom {
   width: 36px; height: 36px; border-radius: 50%;
   border: 1px solid var(--border); background: var(--panel); color: var(--muted);
@@ -772,6 +870,7 @@ li { margin: 4px 0; }
   }
   .bubble { max-width: 96%; }
   .chat-box { border-radius: 16px; }
+  .user-nav { display: none; }
 }`;
 
 export const APP_JS = `"use strict";
@@ -802,6 +901,10 @@ var menuBtn = document.getElementById("btn-menu");
 var drawerBackdrop = document.getElementById("drawer-backdrop");
 var themeBtn = document.getElementById("btn-theme");
 var scrollBtn = document.getElementById("btn-scroll-bottom");
+var userNav = document.getElementById("user-nav");
+var userNavScroll = document.getElementById("user-nav-scroll");
+var userNavClip = document.getElementById("user-nav-clip");
+var userNavList = document.getElementById("user-nav-list");
 var emptyCard = document.getElementById("empty-card");
 var liveWs = makeWorkspace(document.getElementById("traj-live"));
 var historyWs = {};
@@ -837,10 +940,187 @@ function scrollDown() {
 conversation.addEventListener("scroll", function () {
   stickToBottom = nearBottom();
   if (scrollBtn) scrollBtn.hidden = nearBottom();
+  onConversationScroll();
 });
 scrollBtn.addEventListener("click", function () {
   stickToBottom = true;
   conversation.scrollTop = conversation.scrollHeight;
+});
+
+// ---- 右侧对话快速导航（用户提问列表：当前项高亮 + 点击跳转） ----
+// 与 DeepSeek 官网的右侧导航同语义：收起时只有一排短条，鼠标经过展开成提问列表，
+// 当前可见项高亮、点击滚到该条；面板高度随条目数伸缩（上限 52vh）。
+// 消息量大时只渲染视口内的条目（虚拟列表），行高固定 USER_NAV_ITEM_H。
+var USER_NAV_ITEM_H = 30;
+var USER_NAV_PAD = 10;
+var USER_NAV_MIN = 2;
+var USER_NAV_LINE = 16;
+var USER_NAV_COLLAPSED_W = 48;
+var USER_NAV_TEXT_W = 230;
+var userNavEls = [];
+var userNavOpen = false;
+var userNavHoverOpen = false;
+var userNavActive = -1;
+var userNavNodes = [];
+var userNavRaf = 0;
+var userNavCloseTimer = null;
+
+function isUserMsg(el) {
+  return !!el && typeof el.className === "string" && el.className.indexOf("bubble user") === 0;
+}
+function collectUserMsgs() {
+  var out = [];
+  var nodes = convInner.children;
+  for (var i = 0; i < nodes.length; i++) if (isUserMsg(nodes[i])) out.push(nodes[i]);
+  return out;
+}
+function navMaxH() {
+  return Math.max(USER_NAV_ITEM_H * 4 + USER_NAV_PAD * 2, Math.round(window.innerHeight * 0.52));
+}
+function navFullH() {
+  return userNavEls.length * USER_NAV_ITEM_H + USER_NAV_PAD * 2;
+}
+function applyUserNavSize() {
+  if (!userNavScroll) return;
+  userNavScroll.style.maxHeight = navMaxH() + "px";
+  userNav.style.width = (userNavHoverOpen ? USER_NAV_TEXT_W + USER_NAV_COLLAPSED_W : USER_NAV_COLLAPSED_W) + "px";
+}
+function navRender() {
+  if (!userNav || !userNavList) return;
+  userNavEls = collectUserMsgs();
+  var show = tabChat && !tabChat.hidden && userNavEls.length >= USER_NAV_MIN;
+  if (!show) userNavHoverOpen = false;
+  userNav.hidden = !show;
+  userNav.classList.toggle("open", show && userNavHoverOpen);
+  userNavOpen = show;
+  if (!show) {
+    userNavActive = -1;
+    userNavList.replaceChildren();
+    return;
+  }
+  applyUserNavSize();
+  paintUserNav();
+}
+function paintUserNav() {
+  if (!userNavOpen || !userNavList) return;
+  var total = userNavEls.length;
+  var viewH = userNavScroll.clientHeight;
+  var scrollTop = userNavScroll.scrollTop;
+  var first = Math.max(0, Math.floor((scrollTop - USER_NAV_PAD) / USER_NAV_ITEM_H));
+  var count = Math.ceil(viewH / USER_NAV_ITEM_H) + 1;
+  var last = Math.min(total, first + count);
+  var frag = document.createDocumentFragment();
+  userNavNodes = [];
+  for (var i = first; i < last; i++) {
+    var item = document.createElement("div");
+    item.className = "user-nav-item";
+    item.setAttribute("data-i", String(i));
+    item.style.top = (USER_NAV_PAD + i * USER_NAV_ITEM_H) + "px";
+    var txt = document.createElement("div");
+    txt.className = "user-nav-text";
+    var full = String(userNavEls[i].textContent || "").replace(/\\s+/g, " ").trim();
+    txt.textContent = full;
+    item.appendChild(txt);
+    frag.appendChild(item);
+    userNavNodes.push({ i: i, el: item });
+  }
+  userNavClip.style.minHeight = (total * USER_NAV_ITEM_H + USER_NAV_PAD * 2) + "px";
+  userNavList.replaceChildren(frag);
+  computeUserNavActive();
+}
+function paintUserNavActive() {
+  for (var k = 0; k < userNavNodes.length; k++) {
+    userNavNodes[k].el.classList.toggle("active", userNavNodes[k].i === userNavActive);
+  }
+}
+function setUserNavActive(i) {
+  var changed = i !== userNavActive;
+  userNavActive = i;
+  paintUserNavActive();
+  if (changed) scrollNavToActive();
+  return changed;
+}
+function computeUserNavActive() {
+  if (!userNavOpen || !userNavEls.length) { setUserNavActive(-1); return; }
+  var convTop = conversation.getBoundingClientRect().top;
+  var viewH = conversation.clientHeight || 0;
+  var best = -1;
+  var bestDist = Infinity;
+  var bestAny = 0;
+  var bestAnyDist = Infinity;
+  for (var i = 0; i < userNavEls.length; i++) {
+    var r = userNavEls[i].getBoundingClientRect();
+    var d = Math.abs(r.top - convTop);
+    if (d < bestAnyDist) { bestAnyDist = d; bestAny = i; }
+    if (r.bottom > convTop && r.top < convTop + viewH && d < bestDist) { bestDist = d; best = i; }
+  }
+  setUserNavActive(best >= 0 ? best : bestAny);
+}
+function scrollNavToActive() {
+  if (userNavActive < 0 || !userNavOpen || !userNavHoverOpen) return;
+  var viewH = userNavScroll.clientHeight;
+  var fullH = navFullH();
+  if (!viewH || fullH <= viewH) {
+    if (userNavScroll.scrollTop !== 0) userNavScroll.scrollTop = 0;
+    return;
+  }
+  var top = USER_NAV_PAD + userNavActive * USER_NAV_ITEM_H + USER_NAV_ITEM_H / 2 - viewH / 2;
+  top = Math.max(0, Math.min(fullH - viewH, top));
+  if (top !== userNavScroll.scrollTop) userNavScroll.scrollTop = top;
+}
+function setUserNavHover(open) {
+  if (userNavCloseTimer) {
+    clearTimeout(userNavCloseTimer);
+    userNavCloseTimer = null;
+  }
+  if (open === userNavHoverOpen || !userNavOpen) return;
+  userNavHoverOpen = open;
+  if (open) {
+    applyUserNavSize();
+    userNav.classList.add("open");
+    paintUserNav();
+    scrollNavToActive();
+    return;
+  }
+  userNav.classList.remove("open");
+  userNavCloseTimer = setTimeout(function () {
+    userNavCloseTimer = null;
+    applyUserNavSize();
+    if (userNavScroll.scrollTop !== 0) userNavScroll.scrollTop = 0;
+    paintUserNav();
+  }, 260);
+}
+function onConversationScroll() {
+  if (userNavRaf || !userNavOpen) return;
+  userNavRaf = requestAnimationFrame(function () {
+    userNavRaf = 0;
+    computeUserNavActive();
+  });
+}
+function navSelect(i) {
+  var el = userNavEls[i];
+  if (!el || !convInner.contains(el)) return;
+  setUserNavActive(i);
+  var top = el.getBoundingClientRect().top - conversation.getBoundingClientRect().top + conversation.scrollTop;
+  conversation.scrollTop = Math.max(0, top - USER_NAV_LINE / 2);
+}
+userNav.addEventListener("mouseenter", function () { setUserNavHover(true); });
+userNav.addEventListener("mouseleave", function () { setUserNavHover(false); });
+userNav.addEventListener("focusin", function () { setUserNavHover(true); });
+userNav.addEventListener("focusout", function () { setUserNavHover(false); });
+userNavList.addEventListener("click", function (ev) {
+  var item = ev.target.closest ? ev.target.closest(".user-nav-item") : null;
+  if (!item) return;
+  navSelect(parseInt(item.getAttribute("data-i"), 10));
+});
+userNavScroll.addEventListener("scroll", function () {
+  if (!userNavOpen) return;
+  paintUserNav();
+});
+window.addEventListener("resize", function () {
+  if (!userNavOpen) return;
+  applyUserNavSize();
+  paintUserNav();
 });
 function esc(s) {
   return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
@@ -1687,11 +1967,21 @@ function bubble(cls, textOrHtml, isHtml, attachments) {
   var copyBtn = document.createElement("button");
   copyBtn.className = "copy";
   copyBtn.title = "复制";
+  if (cls === "user") {
+    el._answerText = String(textOrHtml == null ? "" : textOrHtml).trim();
+  }
   copyBtn.innerHTML = '<svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M6.14929 4.02032C7.11197 4.02032 7.87983 4.02016 8.49597 4.07598C9.12128 4.13269 9.65792 4.25188 10.1415 4.53106C10.7202 4.8653 11.2008 5.3459 11.535 5.92462C11.8142 6.40818 11.9334 6.94481 11.9901 7.57012C12.0459 8.18625 12.0458 8.95419 12.0458 9.9168C12.0458 10.8795 12.0459 11.6473 11.9901 12.2635C11.9334 12.8888 11.8142 13.4254 11.535 13.909C11.2008 14.4877 10.7202 14.9683 10.1415 15.3025C9.65792 15.5817 9.12128 15.7009 8.49597 15.7576C7.87984 15.8134 7.11196 15.8133 6.14929 15.8133C5.18667 15.8133 4.41874 15.8134 3.80261 15.7576C3.1773 15.7009 2.64067 15.5817 2.1571 15.3025C1.5784 14.9683 1.09778 14.4877 0.76355 13.909C0.484366 13.4254 0.365184 12.8888 0.308472 12.2635C0.252649 11.6473 0.252808 10.8795 0.252808 9.9168C0.252808 8.95418 0.252664 8.18625 0.308472 7.57012C0.365184 6.94481 0.484366 6.40818 0.76355 5.92462C1.09777 5.34589 1.57839 4.86529 2.1571 4.53106C2.64067 4.25188 3.1773 4.13269 3.80261 4.07598C4.41874 4.02017 5.18666 4.02032 6.14929 4.02032ZM6.14929 5.37774C5.16181 5.37774 4.46634 5.37761 3.92566 5.42657C3.39434 5.47472 3.07859 5.56574 2.83582 5.70587C2.4632 5.92106 2.15354 6.2307 1.93835 6.60333C1.79823 6.8461 1.70721 7.16185 1.65906 7.69317C1.6101 8.23385 1.61023 8.92933 1.61023 9.9168C1.61023 10.9043 1.61009 11.5998 1.65906 12.1404C1.70721 12.6717 1.79823 12.9875 1.93835 13.2303C2.15356 13.6029 2.46321 13.9126 2.83582 14.1277C3.07859 14.2679 3.39434 14.3589 3.92566 14.407C4.46634 14.456 5.16182 14.4559 6.14929 14.4559C7.13682 14.4559 7.83224 14.456 8.37292 14.407C8.90425 14.3589 9.21999 14.2679 9.46277 14.1277C9.83535 13.9126 10.145 13.6029 10.3602 13.2303C10.5004 12.9875 10.5914 12.6717 10.6395 12.1404C10.6885 11.5998 10.6884 10.9043 10.6884 9.9168C10.6884 8.92934 10.6885 8.23384 10.6395 7.69317C10.5914 7.16185 10.5004 6.8461 10.3602 6.60333C10.1451 6.23071 9.83536 5.92107 9.46277 5.70587C9.21999 5.56574 8.90424 5.47472 8.37292 5.42657C7.83224 5.3776 7.13682 5.37774 6.14929 5.37774ZM9.80164 0.367975C10.7638 0.367975 11.5314 0.36788 12.1473 0.423639C12.7726 0.480307 13.3093 0.598759 13.7928 0.877741C14.3717 1.21192 14.8521 1.69355 15.1864 2.27227C15.4655 2.75574 15.5857 3.29164 15.6425 3.9168C15.6983 4.53301 15.6971 5.3016 15.6971 6.26446V7.82989C15.6971 8.29264 15.6989 8.58993 15.6649 8.84844C15.4668 10.3525 14.401 11.5738 12.9833 11.9988V10.5467C13.6973 10.1903 14.2105 9.49662 14.3192 8.67169C14.3387 8.52347 14.3407 8.3358 14.3407 7.82989V6.26446C14.3407 5.27706 14.3398 4.58149 14.2909 4.04083C14.2428 3.50968 14.1526 3.19372 14.0126 2.95098C13.7974 2.57849 13.4876 2.26869 13.1151 2.05352C12.8724 1.91347 12.5564 1.82237 12.0253 1.77423C11.4847 1.72528 10.7888 1.7254 9.80164 1.7254H7.71472C6.7562 1.72558 5.92665 2.27697 5.52332 3.07891H4.07019C4.54221 1.51132 5.9932 0.368186 7.71472 0.367975H9.80164Z" fill="currentColor"></path></svg>';
   el.appendChild(body);
-  if (cls.indexOf("assistant") === 0) el._copyBtn = copyBtn;
+  if (cls.indexOf("assistant") === 0 || cls === "user") el._copyBtn = copyBtn;
   if (currentRunId) el.setAttribute("data-run", currentRunId);
   convInner.appendChild(el);
+  if (cls === "user") {
+    copyBtn.classList.add("user-copy");
+    copyBtn._host = el;
+    if (currentRunId) copyBtn.setAttribute("data-run", currentRunId);
+    convInner.appendChild(copyBtn);
+  }
+  if (cls === "user") navRender();
   scrollDown();
   return el;
 }
@@ -1733,6 +2023,7 @@ function switchTab(name) {
   tabChatBtn.classList.toggle("active", chat);
   tabTrajBtn.classList.toggle("active", !chat);
   if (!chat && liveWs) redrawOverview(liveWs);
+  else navRender();
 }
 tabChatBtn.addEventListener("click", function () { switchTab("chat"); });
 tabTrajBtn.addEventListener("click", function () { switchTab("trajectory"); });
@@ -1917,10 +2208,12 @@ function restoreState() {
   if (conv) {
     if (emptyCard) emptyCard.remove();
     convInner.innerHTML = conv;
+    settleTodoCards();
     stickToBottom = true;
     scrollDown();
   }
   if (model) modelLabel.textContent = model;
+  navRender();
   if (cum && typeof cum.in === "number") {
     cumInput = cum.in;
     cumCache = cum.cache || 0;
@@ -1957,7 +2250,8 @@ conversation.addEventListener("click", function (ev) {
   }
   var copyBtn = target.closest(".copy");
   if (copyBtn) {
-    var host = copyBtn.parentElement;
+    var host = copyBtn._host || copyBtn.parentElement;
+    if (host && host.id === "conv-inner") host = copyBtn.previousElementSibling;
     var bodyEl = host && host.querySelector ? host.querySelector(".body") : null;
     if (host && host._answerText) {
       if (navigator.clipboard && navigator.clipboard.writeText) {
@@ -1967,10 +2261,28 @@ conversation.addEventListener("click", function (ev) {
       navigator.clipboard.writeText(bodyEl.textContent.trim()).catch(function () {});
     }
   }
+  var todoHead = target.closest(".todo-head");
+  if (todoHead) {
+    var todoCard = todoHead.parentElement;
+    if (todoCard && todoCard.classList.contains("todo-card")) {
+      todoCard.classList.toggle("collapsed");
+    }
+  }
 });
 
 var pendingAssistant = null;
 var lastTool = null;
+var todoLiveCard = null;
+var runFirstUser = null;
+var todoDock = document.getElementById("todo-dock");
+if (todoDock) todoDock.addEventListener("click", function (ev) {
+  var t = ev.target;
+  if (!t || !t.closest) return;
+  var h = t.closest(".todo-head");
+  if (h && h.parentElement && h.parentElement.classList.contains("todo-card")) {
+    h.parentElement.classList.toggle("collapsed");
+  }
+});
 var toolSerial = 0;
 var runStart = null;
 var runTimer = null;
@@ -2018,6 +2330,113 @@ function todoListText(args) {
   }
   return lines.join("\\n");
 }
+function todoTodos(args) {
+  return args && Array.isArray(args.todos) ? args.todos : [];
+}
+function paintTodoCard(card, todos) {
+  var done = 0;
+  var i = 0;
+  for (i = 0; i < todos.length; i++) if (todos[i] && todos[i].status === "completed") done++;
+  var count = card.querySelector(".todo-count");
+  if (count) count.textContent = todos.length ? done + "/" + todos.length + " 完成" : "空清单";
+  var bar = card.querySelector(".todo-bar > i");
+  if (bar) bar.style.width = todos.length ? Math.round(done / todos.length * 100) + "%" : "0%";
+  var ul = card.querySelector(".todo-list");
+  ul.replaceChildren();
+  for (i = 0; i < todos.length; i++) {
+    var t = todos[i] || {};
+    var st = t.status === "completed" ? "done" : t.status === "active" ? "active" : "pending";
+    var li = document.createElement("li");
+    li.className = "todo-" + st;
+    var mk = document.createElement("span");
+    mk.className = "todo-mark";
+    mk.textContent = st === "done" ? "✓" : st === "active" ? "▶" : "○";
+    li.appendChild(mk);
+    var tx = document.createElement("span");
+    tx.className = "todo-text";
+    tx.textContent = t.content || "";
+    li.appendChild(tx);
+    if (t.priority) {
+      var pr = document.createElement("span");
+      pr.className = "todo-pri";
+      pr.textContent = t.priority;
+      li.appendChild(pr);
+    }
+    ul.appendChild(li);
+  }
+  if (!todos.length) {
+    var li0 = document.createElement("li");
+    li0.className = "todo-pending";
+    var tx0 = document.createElement("span");
+    tx0.className = "todo-text";
+    tx0.textContent = "（空任务清单）";
+    li0.appendChild(tx0);
+    ul.appendChild(li0);
+  }
+}
+function makeTodoCard(live) {
+  var card = document.createElement("div");
+  card.className = "todo-card" + (live ? " live" : " done collapsed");
+  var head = document.createElement("div");
+  head.className = "todo-head";
+  var badge = document.createElement("span");
+  badge.className = "todo-badge " + (live ? "running" : "ok");
+  badge.textContent = live ? "进行中" : "已完成";
+  var title = document.createElement("span");
+  title.textContent = "任务清单";
+  var count = document.createElement("span");
+  count.className = "todo-count";
+  var caret = document.createElement("span");
+  caret.className = "caret";
+  caret.textContent = "›";
+  head.appendChild(badge);
+  head.appendChild(title);
+  head.appendChild(count);
+  head.appendChild(caret);
+  var body = document.createElement("div");
+  body.className = "todo-body";
+  var bar = document.createElement("div");
+  bar.className = "todo-bar";
+  bar.appendChild(document.createElement("i"));
+  var ul = document.createElement("ul");
+  ul.className = "todo-list";
+  body.appendChild(bar);
+  body.appendChild(ul);
+  card.appendChild(head);
+  card.appendChild(body);
+  if (typeof currentRunId !== "undefined" && currentRunId) card.setAttribute("data-run", currentRunId);
+  return card;
+}
+function anchorTodoCard(card) {
+  var anchor = (runFirstUser && runFirstUser.isConnected) ? runFirstUser : null;
+  if (!anchor) {
+    var users = convInner.querySelectorAll(".bubble.user");
+    anchor = users.length ? users[users.length - 1] : null;
+  }
+  var refNode = anchor ? anchor.nextSibling : null;
+  while (refNode && refNode.classList && refNode.classList.contains("user-copy")) refNode = refNode.nextSibling;
+  convInner.insertBefore(card, refNode);
+}
+function finalizeTodoCard() {
+  if (!todoLiveCard) return;
+  var card = todoLiveCard;
+  todoLiveCard = null;
+  card.classList.remove("live");
+  card.classList.add("done", "collapsed");
+  var badge = card.querySelector(".todo-badge");
+  if (badge) { badge.className = "todo-badge ok"; badge.textContent = "已完成"; }
+  var bar = card.querySelector(".todo-bar > i");
+  if (bar) bar.style.background = "var(--ok)";
+  anchorTodoCard(card);
+  if (todoDock) todoDock.hidden = true;
+}
+function settleTodoCards() {
+  var stale = convInner.querySelectorAll(".todo-card.live");
+  for (var i = 0; i < stale.length; i++) {
+    todoLiveCard = stale[i];
+    finalizeTodoCard();
+  }
+}
 function argBrief(args) {
   if (!args) return "";
   if (typeof args.url === "string") return args.url;
@@ -2038,6 +2457,8 @@ function handleLiveEvent(e) {
   switch (e.type) {
     case "agent_start":
       setStatus("busy");
+      runFirstUser = null;
+      finalizeTodoCard();
       runStart = Date.now();
       runTools = 0;
       runTokensIn = 0;
@@ -2059,6 +2480,7 @@ function handleLiveEvent(e) {
       runStart = null;
       setStatus("idle");
       pendingAssistant = null;
+      finalizeTodoCard();
       scheduleSave();
       saveTraj(liveWs);
       if (liveWs.metaEl) liveWs.metaEl.textContent = "已完成";
@@ -2074,7 +2496,8 @@ function handleLiveEvent(e) {
         pendingAssistant = bubble("assistant", renderAssistant(e.message), true);
         trajMessageStart(liveWs, e.message);
       } else if (e.message.role === "user") {
-        bubble("user", e.message.content, false, e.message.attachments);
+        var nub = bubble("user", e.message.content, false, e.message.attachments);
+        if (!runFirstUser || !runFirstUser.isConnected) runFirstUser = nub;
         trajUserStart(liveWs, e.message);
       }
       scheduleSave();
@@ -2119,6 +2542,24 @@ case "message_update":
       runTools++;
       statTools.textContent = String(runTools);
       toolSerial++;
+      if (!liveWs.currentTurn) createTurn(liveWs);
+      addToolToTurn(liveWs, liveWs.currentTurn, e);
+      if (e.toolName === "todowrite") {
+        lastTool = null;
+        var todos = todoTodos(e.args);
+        if (!todoLiveCard || !todoLiveCard.isConnected) {
+          finalizeTodoCard();
+          todoLiveCard = makeTodoCard(true);
+          if (todoDock) {
+            todoDock.appendChild(todoLiveCard);
+            todoDock.hidden = false;
+          } else {
+            anchorTodoCard(todoLiveCard);
+          }
+        }
+        paintTodoCard(todoLiveCard, todos);
+        break;
+      }
       var brief = argBrief(e.args);
       lastTool = document.createElement("details");
       lastTool.className = "tool-block";
@@ -2139,18 +2580,15 @@ case "message_update":
       var pre = document.createElement("pre");
       if (e.toolName === "fetch") {
         pre.textContent = "【正在联网查询中】";
-      } else if (e.toolName === "todowrite") {
-        pre.textContent = "任务清单:\\n" + todoListText(e.args);
       } else {
         pre.textContent = "参数:\\n" + argsHtml(e.args) + "\\n运行中...";
       }
       lastTool.appendChild(pre);
       lastTool._t0 = Date.now();
+      lastTool._tcid = e.toolCallId;
       lastTool._badge = badge;
       lastTool._brief = brief;
-      lastTool._args = e.toolName === "todowrite" ? todoListText(e.args) : argsHtml(e.args);
-      if (!liveWs.currentTurn) createTurn(liveWs);
-      addToolToTurn(liveWs, liveWs.currentTurn, e);
+      lastTool._args = argsHtml(e.args);
       if (currentRunId) lastTool.setAttribute("data-run", currentRunId);
       convInner.appendChild(lastTool);
       scrollDown();
@@ -2179,7 +2617,7 @@ case "message_update":
           }
         }
       }
-      if (lastTool) {
+      if (lastTool && lastTool._tcid === e.toolCallId) {
         var dur = fmtDur(Date.now() - lastTool._t0);
         lastTool._badge.textContent = (e.isError ? "ERR " : "OK ") + dur;
         lastTool._badge.className = "badge " + (e.isError ? "err" : "ok");
@@ -2525,9 +2963,12 @@ function send() {
   sendMessage();
 }
 
+var sendPending = false;
 function sendMessage() {
   var text = ta.value.trim();
   if (!text && !pendingAttachments.length) return;
+  if (sendPending) return;
+  sendPending = true;
   sendBtn.disabled = true;
   uploadPendingAttachments()
     .then(function () {
@@ -2542,10 +2983,12 @@ function sendMessage() {
       }).then(function (r) { return r.json(); });
     })
     .then(function (r) {
+      sendPending = false;
       sendBtn.disabled = false;
       if (r && r.error) { setStatus("err"); bubble("error", r.error); }
     })
     .catch(function (err) {
+      sendPending = false;
       sendBtn.disabled = false;
       setStatus("err");
       bubble("error", "发送失败：" + String((err && err.message) || err));
@@ -2598,6 +3041,7 @@ document.getElementById("btn-clear").addEventListener("click", function () {
       convInner.innerHTML = EMPTY_CARD;
     }
     try { localStorage.removeItem("tju.gui.conv"); } catch (e) {}
+    navRender();
     updateChips();
   });
 });
@@ -2988,6 +3432,10 @@ function renderToolBlock(name, args, resultText, isError) {
 
 function renderConversation(messages) {
   convInner.replaceChildren();
+  navRender();
+  var runTodoCard = null;
+  if (todoDock) { todoDock.replaceChildren(); todoDock.hidden = true; }
+  todoLiveCard = null;
   try { localStorage.removeItem("tju.gui.conv"); localStorage.removeItem("tju.gui.traj"); } catch (e) {}
   clearTrajectory();
   if (!messages || !messages.length) {
@@ -2999,7 +3447,14 @@ function renderConversation(messages) {
     var m = messages[i];
     if (!m || !m.role) continue;
     if (m.role === "user") {
-      bubble("user", typeof m.content === "string" ? m.content : "", false, m.attachments);
+      runTodoCard = null;
+      var ub = bubble("user", typeof m.content === "string" ? m.content : "", false, m.attachments);
+      if (ub._copyBtn && ub._answerText) {
+        ub._copyBtn.classList.add("user-copy");
+        ub._copyBtn._host = ub;
+        convInner.appendChild(ub._copyBtn);
+        ub._copyBtn = null;
+      }
     } else if (m.role === "assistant") {
       var thinking = "";
       var text = "";
@@ -3027,7 +3482,15 @@ function renderConversation(messages) {
         i++;
         var tr = messages[i];
         var call = byId[tr.toolCallId] || null;
-        renderToolBlock(tr.toolName, call ? call.arguments : null, tr.content, !!tr.isError);
+        if (tr.toolName === "todowrite" && call && call.arguments) {
+          if (!runTodoCard || !runTodoCard.isConnected) {
+            runTodoCard = makeTodoCard(false);
+            anchorTodoCard(runTodoCard);
+          }
+          paintTodoCard(runTodoCard, todoTodos(call.arguments));
+        } else {
+          renderToolBlock(tr.toolName, call ? call.arguments : null, tr.content, !!tr.isError);
+        }
       }
     } else if (m.role === "toolResult") {
       renderToolBlock(m.toolName, null, m.content, !!m.isError);
@@ -3132,6 +3595,12 @@ document.getElementById("approval-no").addEventListener("click", function () { a
 es.addEventListener("message", function (ev) {
   var msg;
   try { msg = JSON.parse(ev.data); } catch (e) { return; }
+  handleServerMessage(msg);
+});
+var suppressReplay = false;
+function handleServerMessage(msg) {
+  if (!msg || typeof msg !== "object") return;
+  if (msg.kind === "replay" && suppressReplay) return;
   if (msg.kind === "event" || msg.kind === "replay") {
     if (msg.event.type === "agent_start") {
       if (msg.kind === "replay" && msg.runId) {
@@ -3156,9 +3625,13 @@ es.addEventListener("message", function (ev) {
     }
     if (msg.work) {
       currentWorkId = msg.work.id;
-      renderConversation(msg.work.messages || []);
-      if (msg.work.messages && msg.work.messages.length) {
-        try { localStorage.setItem("tju.gui.conv", convInner.innerHTML); } catch (e) {}
+      var streaming = !!(msg.state && msg.state.isStreaming);
+      suppressReplay = !streaming;
+      if (!streaming) {
+        renderConversation(msg.work.messages || []);
+        if (msg.work.messages && msg.work.messages.length) {
+          try { localStorage.setItem("tju.gui.conv", convInner.innerHTML); } catch (e) {}
+        }
       }
     }
     setStatus(msg.state && msg.state.isStreaming ? "busy" : "idle");
@@ -3175,6 +3648,6 @@ es.addEventListener("message", function (ev) {
   }
   else if (msg.kind === "error") { setStatus("err"); bubble("error", msg.message || "unknown error"); }
   else if (msg.kind === "works") { loadWorks(); }
-});
+}
 es.onerror = function () { setStatus("err"); };
 restoreState();`;
