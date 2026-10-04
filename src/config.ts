@@ -24,6 +24,8 @@ export interface RunConfig {
 	logRetentionDays?: number;
 	/** Directory for persisted work items. Defaults to ~/.tju-code/works. */
 	sessionDir?: string;
+	/** Base URL of the self-update static dir (latest.json). Flag --update-url or TJU_UPDATE_URL. Empty disables updates. */
+	updateUrl?: string;
 }
 
 const DEFAULT_MODELS: Record<ApiKind, { id: string; provider: string }> = {
@@ -153,6 +155,8 @@ export function resolveConfig(flags: CliFlags, env: NodeJS.ProcessEnv = process.
 		logRetentionDays:
 			typeof flags["log-retention"] === "string" ? safePositiveNumber(flags["log-retention"]) : undefined,
 		sessionDir: typeof flags["session-dir"] === "string" && flags["session-dir"] ? flags["session-dir"] : undefined,
+		updateUrl:
+			(typeof flags["update-url"] === "string" && flags["update-url"]) || env.TJU_UPDATE_URL || undefined,
 	};
 }
 

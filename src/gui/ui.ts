@@ -156,13 +156,34 @@ export const VIEW_HTML = `<!DOCTYPE html>
 <div class="modal-backdrop" id="settings-backdrop" hidden>
   <div class="modal settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title">
     <div class="modal-title" id="settings-title">设置</div>
-    <label class="settings-row" for="opt-enter-send">
-      <span class="settings-label">
-        <span class="settings-name">Enter 发送</span>
-        <span class="settings-hint">勾选后按 Enter 直接发送，Shift+Enter 换行；不勾选则 Ctrl/Cmd+Enter 发送</span>
-      </span>
-      <input type="checkbox" id="opt-enter-send" class="settings-check" />
-    </label>
+    <div class="tab-switch settings-tabs">
+      <button id="settings-tab-general" class="tab-btn active">通用</button>
+      <button id="settings-tab-update" class="tab-btn">更新</button>
+    </div>
+    <div id="settings-pane-general">
+      <label class="settings-row" for="opt-enter-send">
+        <span class="settings-label">
+          <span class="settings-name">Enter 发送</span>
+          <span class="settings-hint">勾选后按 Enter 直接发送，Shift+Enter 换行；不勾选则 Ctrl/Cmd+Enter 发送</span>
+        </span>
+        <input type="checkbox" id="opt-enter-send" class="settings-check" />
+      </label>
+    </div>
+    <div id="settings-pane-update" hidden>
+      <div class="settings-row">
+        <span class="settings-label">
+          <span class="settings-name">当前版本 <span class="update-ver" id="update-ver">-</span></span>
+          <span class="settings-hint" id="update-status">点击“检查更新”查看是否有新版本</span>
+        </span>
+      </div>
+      <div class="update-actions">
+        <button id="btn-update-check" class="modal-btn">检查更新</button>
+        <button id="btn-update-apply" class="modal-btn primary" hidden>立即更新</button>
+        <button id="btn-update-rollback" class="modal-btn" hidden>回滚上一版</button>
+        <button id="btn-update-restart" class="modal-btn primary" hidden>重启服务</button>
+        <button id="btn-update-reload" class="modal-btn primary" hidden>刷新页面</button>
+      </div>
+    </div>
     <div class="modal-actions">
       <button id="settings-close" class="modal-btn primary">完成</button>
     </div>
@@ -755,11 +776,15 @@ li { margin: 4px 0; }
   padding: 7px 16px; border-radius: 8px; cursor: pointer; font-size: 13px;
 }
 .modal-btn:hover { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
+.modal-btn:disabled { opacity: .55; cursor: not-allowed; }
+.modal-btn:disabled:hover { background: var(--bg); border-color: var(--border); color: var(--text); }
+.modal-btn.primary:disabled:hover { background: var(--accent); border-color: var(--accent); color: #fff; }
 .modal-btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
 .modal-btn.primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); color: #fff; }
 .modal-btn.danger { background: var(--err); border-color: var(--err); color: #fff; font-weight: 600; }
 .modal-btn.danger:hover { filter: brightness(1.05); color: #fff; }
 .settings-modal { width: min(440px, 100%); }
+.settings-tabs { margin-top: 14px; align-self: flex-start; }
 .settings-row {
   display: flex; align-items: flex-start; gap: 14px; cursor: pointer;
   margin-top: 16px; padding: 12px 14px;
@@ -770,6 +795,11 @@ li { margin: 4px 0; }
 .settings-name { font-size: 13px; font-weight: 600; color: var(--text); }
 .settings-hint { font-size: 12px; line-height: 1.55; color: var(--muted); }
 .settings-check { flex: none; width: 17px; height: 17px; margin-top: 2px; accent-color: var(--accent); cursor: pointer; }
+.update-ver {
+  font-family: "SF Mono", "JetBrains Mono", "Fira Code", Consolas, monospace;
+  font-size: 12px; color: var(--muted); font-weight: 500;
+}
+.update-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
 .traj-row-detail {
   margin: 0 10px 0 18px; padding: 8px 10px;
   border: 1px solid var(--border-strong); border-radius: 6px;
@@ -2725,6 +2755,7 @@ function applySendMode() {
 }
 function openSettings() {
   applySendMode();
+  switchSettingsTab("general");
   settingsBackdrop.hidden = false;
   optEnterSend.focus();
 }
@@ -2741,6 +2772,174 @@ optEnterSend.addEventListener("change", function () {
   applySendMode();
   ta.focus();
 });
+applySendMode();
+
+// ---- settings tabs (通用 / 更新) + self update ----
+var settingsTabGeneral = document.getElementById("settings-tab-general");
+var settingsTabUpdate = document.getElementById("settings-tab-update");
+var settingsPaneGeneral = document.getElementById("settings-pane-general");
+var settingsPaneUpdate = document.getElementById("settings-pane-update");
+var updateVer = document.getElementById("update-ver");
+var updateStatus = document.getElementById("update-status");
+var btnUpdateCheck = document.getElementById("btn-update-check");
+var btnUpdateApply = document.getElementById("btn-update-apply");
+var btnUpdateRollback = document.getElementById("btn-update-rollback");
+var btnUpdateRestart = document.getElementById("btn-update-restart");
+var btnUpdateReload = document.getElementById("btn-update-reload");
+var updateApiHeaders = { "x-agent-token": AGENT_TOKEN };
+function setUpdateStatus(t) { if (updateStatus) updateStatus.textContent = t; }
+function switchSettingsTab(name) {
+  var general = name !== "update";
+  settingsTabGeneral.classList.toggle("active", general);
+  settingsTabUpdate.classList.toggle("active", !general);
+  settingsPaneGeneral.hidden = !general;
+  settingsPaneUpdate.hidden = general;
+  if (!general) loadUpdateVersion();
+}
+settingsTabGeneral.addEventListener("click", function () { switchSettingsTab("general"); });
+settingsTabUpdate.addEventListener("click", function () { switchSettingsTab("update"); });
+function loadUpdateVersion() {
+  btnUpdateCheck.hidden = false;
+  btnUpdateCheck.disabled = false;
+  btnUpdateCheck.textContent = "检查更新";
+  btnUpdateApply.hidden = true;
+  btnUpdateApply.disabled = false;
+  btnUpdateApply.textContent = "立即更新";
+  btnUpdateRestart.hidden = true;
+  btnUpdateRestart.disabled = false;
+  btnUpdateRestart.textContent = "重启服务";
+  btnUpdateReload.hidden = true;
+  btnUpdateRollback.disabled = false;
+  btnUpdateRollback.textContent = "回滚上一版";
+  fetch("/api/version", { headers: updateApiHeaders })
+    .then(function (r) { return r.json(); })
+    .then(function (d) {
+      if (!d) return;
+      updateVer.textContent = "v" + (d.version || "?");
+      btnUpdateRollback.hidden = !d.hasBackup;
+      if (d.pendingRestart) {
+        btnUpdateCheck.hidden = true;
+        btnUpdateApply.hidden = true;
+        btnUpdateRollback.hidden = true;
+        btnUpdateReload.hidden = true;
+        btnUpdateRestart.hidden = false;
+        setUpdateStatus("新版本已就绪，重启后生效（当前仍在运行旧版本）");
+        return;
+      }
+      if (!d.updateUrl) setUpdateStatus("未配置更新源（TJU_UPDATE_URL / --update-url），请先配置再检查更新");
+    })
+    .catch(function () { setUpdateStatus("版本信息读取失败"); });
+}
+btnUpdateCheck.addEventListener("click", function () {
+  btnUpdateCheck.disabled = true;
+  btnUpdateCheck.textContent = "检查中…";
+  btnUpdateApply.hidden = true;
+  btnUpdateRestart.hidden = true;
+  btnUpdateReload.hidden = true;
+  setUpdateStatus("正在检查更新…");
+  fetch("/api/update/check", { headers: updateApiHeaders })
+    .then(function (r) { return r.json(); })
+    .then(function (d) {
+      btnUpdateCheck.disabled = false;
+      btnUpdateCheck.textContent = "检查更新";
+      if (!d) { setUpdateStatus("检查失败"); return; }
+      if (d.error) { setUpdateStatus(d.error); return; }
+      if (d.available) {
+        setUpdateStatus("发现新版本 v" + d.latest + "（当前 v" + d.current + "），点击立即更新");
+        btnUpdateApply.hidden = false;
+      } else {
+        setUpdateStatus("已是最新版本（v" + (d.latest || d.current) + "）");
+      }
+    })
+    .catch(function (err) {
+      btnUpdateCheck.disabled = false;
+      btnUpdateCheck.textContent = "检查更新";
+      setUpdateStatus("检查失败：" + String((err && err.message) || err));
+    });
+});
+function updateNeedRestart(version) {
+  btnUpdateCheck.hidden = true;
+  btnUpdateApply.hidden = true;
+  btnUpdateRollback.hidden = true;
+  btnUpdateReload.hidden = true;
+  btnUpdateRestart.hidden = false;
+  setUpdateStatus("新版本" + (version ? " v" + version : "") + "已下载替换，重启后生效（当前仍在运行旧版本）");
+}
+function updateRestarting(version) {
+  btnUpdateCheck.hidden = true;
+  btnUpdateApply.hidden = true;
+  btnUpdateRollback.hidden = true;
+  btnUpdateRestart.hidden = true;
+  btnUpdateReload.hidden = false;
+  setUpdateStatus("已开始更新" + (version ? "到 v" + version : "") + "，服务正在重启，稍后请刷新页面");
+}
+btnUpdateApply.addEventListener("click", function () {
+  btnUpdateApply.disabled = true;
+  btnUpdateApply.textContent = "更新中…";
+  setUpdateStatus("正在下载新版本…");
+  fetch("/api/update/apply", { method: "POST", headers: updateApiHeaders })
+    .then(function (r) { return r.json().then(function (d) { return { status: r.status, body: d }; }); })
+    .then(function (x) {
+      if (x.body && x.body.ok) { updateNeedRestart(x.body.version); return; }
+      btnUpdateApply.disabled = false;
+      btnUpdateApply.textContent = "立即更新";
+      if (x.status === 409) { setUpdateStatus((x.body && x.body.error) || "任务执行中，请稍后再试"); return; }
+      setUpdateStatus((x.body && (x.body.error || x.body.message)) || "更新失败");
+    })
+    .catch(function (err) {
+      btnUpdateApply.disabled = false;
+      btnUpdateApply.textContent = "立即更新";
+      setUpdateStatus("更新失败：" + String((err && err.message) || err));
+    });
+});
+btnUpdateRestart.addEventListener("click", function () {
+  btnUpdateRestart.disabled = true;
+  btnUpdateRestart.textContent = "重启中…";
+  setUpdateStatus("正在重启服务…");
+  fetch("/api/update/restart", { method: "POST", headers: updateApiHeaders })
+    .then(function (r) { return r.json().then(function (d) { return { status: r.status, body: d }; }); })
+    .then(function (x) {
+      if (x.body && x.body.ok) { updateRestarting(null); return; }
+      btnUpdateRestart.disabled = false;
+      btnUpdateRestart.textContent = "重启服务";
+      if (x.status === 409) { setUpdateStatus((x.body && x.body.error) || "任务执行中，请稍后再试"); return; }
+      setUpdateStatus((x.body && x.body.error) || "重启失败");
+    })
+    .catch(function (err) {
+      btnUpdateRestart.disabled = false;
+      btnUpdateRestart.textContent = "重启服务";
+      setUpdateStatus("重启失败：" + String((err && err.message) || err));
+    });
+});
+btnUpdateRollback.addEventListener("click", function () {
+  showModal({
+    title: "回滚上一版",
+    text: "确定回滚到上一版吗？文件替换后需要手动点“重启服务”生效。",
+    okText: "回滚",
+    danger: true,
+    showCancel: true,
+    onOk: function () {
+      btnUpdateRollback.disabled = true;
+      btnUpdateRollback.textContent = "回滚中…";
+      setUpdateStatus("正在回滚…");
+      fetch("/api/update/rollback", { method: "POST", headers: updateApiHeaders })
+        .then(function (r) { return r.json().then(function (d) { return { status: r.status, body: d }; }); })
+        .then(function (x) {
+          if (x.body && x.body.ok) { updateNeedRestart(null); return; }
+          btnUpdateRollback.disabled = false;
+          btnUpdateRollback.textContent = "回滚上一版";
+          if (x.status === 409) { setUpdateStatus((x.body && x.body.error) || "任务执行中，请稍后再试"); return; }
+          setUpdateStatus((x.body && x.body.error) || "回滚失败");
+        })
+        .catch(function (err) {
+          btnUpdateRollback.disabled = false;
+          btnUpdateRollback.textContent = "回滚上一版";
+          setUpdateStatus("回滚失败：" + String((err && err.message) || err));
+        });
+    }
+  });
+});
+btnUpdateReload.addEventListener("click", function () { location.reload(); });
 applySendMode();
 
 var MAX_ATTACH = 20;

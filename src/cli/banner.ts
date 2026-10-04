@@ -1,5 +1,7 @@
+import { APP_VERSION } from "../version.ts";
+
+export { APP_VERSION };
 export const APP_NAME = "Tju code";
-export const APP_VERSION = "0.1.0";
 
 const GLYPHS: Record<string, string[]> = {
 	T: ["█████", "  █  ", "  █  ", "  █  ", "  █  "],

@@ -13,6 +13,19 @@ import type { CliFlags, RunConfig } from "../config.ts";
 import type { TodoStore, UserMessage } from "../core/types.ts";
 import { APP_JS, STYLE_CSS, VIEW_HTML } from "./ui.ts";
 import { AttachmentStore } from "./attachment-store.ts";
+import { APP_VERSION } from "../version.ts";
+import {
+	checkForUpdate,
+	compareVersions,
+	fetchManifest,
+	hasBackup,
+	relaunch,
+	resolveInstallRoot,
+	stageRelease,
+	stagingDirFor,
+	swapRollback,
+	swapToRelease,
+} from "../update.ts";
 
 interface SseClient {
 	res: ServerResponse;
@@ -47,6 +60,8 @@ export async function startGuiServer(config: RunConfig, flags: CliFlags): Promis
 	let currentWorkId: string | null = null;
 	let currentRunId: string | null = null;
 	let activeLog: EventLog | null = null;
+	let updating = false;
+	let pendingRestart = false;
 
 	const makeRunId = (): string => `${Date.now()}-${randomBytes(3).toString("hex")}`;
 	const makeWorkId = (): string => `${Date.now()}-${randomBytes(3).toString("hex")}`;
@@ -556,6 +571,130 @@ export async function startGuiServer(config: RunConfig, flags: CliFlags): Promis
 				return;
 			}
 
+			if (pathname === "/api/version" && req.method === "GET") {
+				let root: string | null = null;
+				try {
+					root = resolveInstallRoot().root;
+				} catch {
+					root = null;
+				}
+				writeJson(res, 200, {
+					version: APP_VERSION,
+					updateUrl: !!config.updateUrl,
+					hasBackup: root ? hasBackup(root) : false,
+					pendingRestart,
+				});
+				return;
+			}
+
+			if (pathname === "/api/update/check" && req.method === "GET") {
+				if (!config.updateUrl) {
+					writeJson(res, 200, { current: APP_VERSION, available: false, error: "未配置更新源（TJU_UPDATE_URL / --update-url）" });
+					return;
+				}
+				try {
+					const info = await checkForUpdate(config.updateUrl, APP_VERSION);
+					writeJson(res, 200, info);
+				} catch (err) {
+					writeJson(res, 200, { current: APP_VERSION, available: false, error: err instanceof Error ? err.message : String(err) });
+				}
+				return;
+			}
+
+			if (pathname === "/api/update/apply" && req.method === "POST") {
+				if (!config.updateUrl) {
+					writeJson(res, 400, { error: "未配置更新源（TJU_UPDATE_URL / --update-url）" });
+					return;
+				}
+				if (agent.streaming) {
+					writeJson(res, 409, { error: "任务执行中，请等本轮结束后再更新" });
+					return;
+				}
+				if (updating) {
+					writeJson(res, 409, { error: "已有更新正在进行，请勿重复点击" });
+					return;
+				}
+				if (pendingRestart) {
+					writeJson(res, 409, { error: "新版本已就绪，请先重启生效" });
+					return;
+				}
+				let root: string;
+				try {
+					root = resolveInstallRoot().root;
+				} catch (err) {
+					writeJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
+					return;
+				}
+				updating = true;
+				try {
+					const manifest = await fetchManifest(config.updateUrl);
+					if (compareVersions(manifest.version, APP_VERSION) <= 0) {
+						updating = false;
+						writeJson(res, 200, { ok: false, current: APP_VERSION, latest: manifest.version, message: "已是最新版本" });
+						return;
+					}
+					const staging = stagingDirFor(root);
+					await stageRelease(config.updateUrl, manifest, staging);
+					await swapToRelease(root, staging);
+					updating = false;
+					pendingRestart = true;
+					writeJson(res, 200, { ok: true, version: manifest.version, needRestart: true });
+				} catch (err) {
+					updating = false;
+					writeJson(res, 500, { error: err instanceof Error ? err.message : String(err) });
+				}
+				return;
+			}
+
+			if (pathname === "/api/update/restart" && req.method === "POST") {
+				if (agent.streaming) {
+					writeJson(res, 409, { error: "任务执行中，请等本轮结束后再重启" });
+					return;
+				}
+				let root: string;
+				try {
+					root = resolveInstallRoot().root;
+				} catch (err) {
+					writeJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
+					return;
+				}
+				relaunch(root, process.argv.slice(2));
+				console.log("已触发重启，旧服务即将退出，本窗口可直接关闭");
+				writeJson(res, 200, { ok: true });
+				setTimeout(() => process.exit(0), 500);
+				return;
+			}
+
+			if (pathname === "/api/update/rollback" && req.method === "POST") {
+				if (agent.streaming) {
+					writeJson(res, 409, { error: "任务执行中，请等本轮结束后再回滚" });
+					return;
+				}
+				if (updating) {
+					writeJson(res, 409, { error: "已有更新正在进行，请勿重复点击" });
+					return;
+				}
+				let root: string;
+				try {
+					root = resolveInstallRoot().root;
+				} catch (err) {
+					writeJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
+					return;
+				}
+				updating = true;
+				try {
+					await swapRollback(root);
+					updating = false;
+					pendingRestart = true;
+					writeJson(res, 200, { ok: true, needRestart: true });
+					return;
+				} catch (err) {
+					updating = false;
+					writeJson(res, 500, { error: err instanceof Error ? err.message : String(err) });
+				}
+				return;
+			}
+
 			if (pathname === "/api/approve" && req.method === "POST") {
 				const body = await readBody(req);
 				const requestId = typeof body.requestId === "string" ? body.requestId : "";
@@ -687,9 +826,28 @@ export async function startGuiServer(config: RunConfig, flags: CliFlags): Promis
 	});
 
 	await new Promise<void>((resolve, reject) => {
-		server.once("error", reject);
+		let retries = 10;
+		const onError = (err: unknown): void => {
+			if ((err as { code?: string }).code === "EADDRINUSE" && retries > 0 && !server.listening) {
+				retries -= 1;
+				setTimeout(() => server.listen(port, "127.0.0.1", () => resolve()), 300);
+				return;
+			}
+			if ((err as { code?: string }).code === "EADDRINUSE") {
+				console.error(`端口 ${port} 已被占用，服务可能已在运行，无需重复启动，直接用浏览器打开 http://127.0.0.1:${port} 即可`);
+				process.exit(1);
+			}
+			reject(err);
+		};
+		server.on("error", onError);
 		server.listen(port, "127.0.0.1", () => resolve());
 	});
+
+	try {
+		process.title = `Tju code v${APP_VERSION}`;
+	} catch {
+		// title is cosmetic only
+	}
 
 	const url = `http://127.0.0.1:${port}`;
 	console.log(`tju-code GUI: ${url}`);

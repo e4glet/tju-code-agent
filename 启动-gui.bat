@@ -4,30 +4,18 @@ setlocal enabledelayedexpansion
 cd /d "%~dp0"
 
 REM =====================================================
-REM  my-agent one-click launcher
-REM  Edit the CONFIG block below to match your setup.
+REM   tju-code GUI launcher.
+REM   Uses dist if available, otherwise falls back to source.
+REM   Edit the CONFIG block below to match your setup.
 REM =====================================================
 
-REM Preset: deepseek | kimi | qwen | glm | amd
-REM Leave empty to fall back to OPENAI_API_KEY env.
-set "PROFILE=deepseek"
-
-REM Leave empty to use the preset defaults / environment variables.
+REM --- User config ---
 set "API_KEY="
 set "BASE_URL="
 set "MODEL="
-
-REM API kind: openai-completions | anthropic-messages. Empty = use PROFILE default.
-set "API="
-
-REM MODE: chat (terminal) or gui (browser)
-set "MODE=chat"
-
-REM Working directory for the agent; empty means the script folder.
 set "WORKDIR="
-
-REM GUI port (used when MODE=gui)
 set "PORT=9399"
+set "UPDATE_URL=https://www.e4glet.cn/tju_code/update"
 REM =====================================================
 
 where node >nul 2>nul
@@ -37,22 +25,28 @@ if errorlevel 1 (
   exit /b 1
 )
 
+REM Auto-detect API type from BASE_URL
+set "API=openai-completions"
+if not "%BASE_URL%"=="" (
+  echo %BASE_URL% | findstr /i "anthropic" >nul && set "API=anthropic-messages"
+)
+
 if not "%WORKDIR%"=="" cd /d "%WORKDIR%"
 
 set "ARGS="
-if not "!PROFILE!"=="" set "ARGS=!ARGS! --profile !PROFILE!"
-if not "!API_KEY!"==""  set "ARGS=!ARGS! --api-key !API_KEY!"
-if not "!BASE_URL!"=="" set "ARGS=!ARGS! --base-url !BASE_URL!"
-if not "!MODEL!"==""    set "ARGS=!ARGS! --model !MODEL!"
 if not "!API!"==""       set "ARGS=!ARGS! --api !API!"
-if "!MODE!"=="gui"      set "ARGS=!ARGS! --port !PORT!"
+if not "!API_KEY!"==""   set "ARGS=!ARGS! --api-key !API_KEY!"
+if not "!BASE_URL!"==""  set "ARGS=!ARGS! --base-url !BASE_URL!"
+if not "!MODEL!"==""     set "ARGS=!ARGS! --model !MODEL!"
+if not "!UPDATE_URL!"=="" set "ARGS=!ARGS! --update-url !UPDATE_URL!"
+if not "!PORT!"==""      set "ARGS=!ARGS! --port !PORT!"
 
 if exist "%~dp0dist\cli.js" (
-  echo Starting my-agent [%MODE%] ...
-  node "%~dp0dist\cli.js" gui %MODE% !ARGS!
+  echo Starting tju-code [gui] from dist ...
+  node "%~dp0dist\cli.js" gui !ARGS!
 ) else (
   echo dist not found, running from source ...
-  call npx tsx "%~dp0src\cli.ts" !MODE! !ARGS!
+  call npx tsx "%~dp0src\cli.ts" gui !ARGS!
 )
 
 echo.
