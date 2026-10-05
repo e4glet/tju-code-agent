@@ -1,8 +1,8 @@
 import { stdin as input, stdout as output } from "node:process";
 import { createInterface } from "node:readline/promises";
-import { homedir } from "node:os";
 import { join } from "node:path";
 import { createAgent } from "../create-agent.ts";
+import { resolveDataRoot } from "../data-root.ts";
 import { createApprovalGate } from "../core/permission.ts";
 import { SessionStore } from "../core/session-store.ts";
 import type { RunConfig } from "../config.ts";
@@ -46,6 +46,9 @@ function subscribeRenderer(agent: Agent): () => void {
 				}
 				break;
 			}
+			case "notice":
+				write(`\n\u001b[33m[提示]\u001b[0m ${event.message}\n`);
+				break;
 			case "tool_start": {
 				currentToolCallId = event.toolCallId;
 				toolTextLength = 0;
@@ -172,7 +175,7 @@ export async function runChat(config: RunConfig, cwd: string): Promise<void> {
 			}
 		},
 	});
-	const sessionDir = config.sessionDir ?? join(homedir(), ".tju-code", "works");
+	const sessionDir = config.sessionDir ?? join(resolveDataRoot(), "works");
 	const sessionStore = new SessionStore({ dir: sessionDir });
 	const workTodos: TodoStore = { todos: [] };
 	const agent = createAgent({ config, cwd, todoStore: workTodos, beforeToolCall: approval });

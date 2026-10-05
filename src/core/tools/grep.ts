@@ -3,7 +3,7 @@ import { isAbsolute, join, resolve } from "node:path";
 import { z } from "zod";
 import type { AgentTool } from "../types.ts";
 
-const IGNORED_DIRS = new Set([
+export const IGNORED_DIRS = new Set([
 	"node_modules",
 	".git",
 	".hg",
@@ -44,7 +44,7 @@ export function createGrepTool(cwd: string): AgentTool<typeof grepSchema> {
 		label: "grep",
 		description:
 			"Search file contents for a regular expression pattern. Returns matching lines as `file:line: content`. " +
-			"Searches recursively, skipping node_modules/.git and large or binary files.",
+			"Searches recursively, skipping node_modules/.git and large or binary files. Use glob to find files by name first.",
 		parameters: grepSchema,
 		promptSnippet: "search file contents",
 		async execute(_call, { pattern, path, include }) {

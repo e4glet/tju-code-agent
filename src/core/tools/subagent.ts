@@ -3,9 +3,9 @@ import { runAgentLoop } from "../agent-loop.ts";
 import type {
 	AgentContext,
 	AgentLoopConfig,
+	AgentProviderState,
 	AgentTool,
 	AssistantMessage,
-	Model,
 } from "../types.ts";
 
 export const subAgentSchema = z.object({
@@ -21,8 +21,11 @@ export type SubAgentInput = z.infer<typeof subAgentSchema>;
 
 export interface SubAgentToolOptions {
 	cwd: string;
-	model: Model;
-	apiKey?: string;
+	/**
+	 * Live provider state of the orchestrating agent, read at call time so the
+	 * sub-agent runs on whatever interface the parent is currently using.
+	 */
+	provider: AgentProviderState;
 	maxTokens?: number;
 	temperature?: number;
 	/** Maximum assistant turns for the sub-agent. Defaults to 5. */
@@ -69,8 +72,8 @@ export function createSubAgentTool(options: SubAgentToolOptions): AgentTool<type
 		async execute(call, { task }) {
 			const subSystemPrompt = subAgentSystemPrompt(options.cwd);
 			const subConfig: AgentLoopConfig = {
-				model: options.model,
-				apiKey: options.apiKey,
+				model: options.provider.model,
+				apiKey: options.provider.apiKey,
 				maxTokens: options.maxTokens,
 				temperature: options.temperature,
 				systemPrompt: subSystemPrompt,

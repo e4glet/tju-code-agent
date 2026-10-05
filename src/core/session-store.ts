@@ -8,6 +8,7 @@ export interface WorkItem {
 	title: string;
 	cwd: string;
 	model: Model;
+	providerEntryId?: string;
 	messages: Message[];
 	todos: Todo[];
 	createdAt: number;

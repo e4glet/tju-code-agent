@@ -18,6 +18,63 @@ export const editSchema = z.object({
 
 export type EditInput = z.infer<typeof editSchema>;
 
+export type ReplaceAttempt =
+	| { updated: string; replacements: number; fuzzy: boolean }
+	| { updated: null; exactOccurrences: number };
+
+const MIN_FUZZY_CHARS = 8;
+
+function stripWhitespace(s: string): { text: string; index: number[] } {
+	const chars: string[] = [];
+	const index: number[] = [];
+	for (let i = 0; i < s.length; i++) {
+		const ch = s[i] ?? "";
+		if (/\s/.test(ch)) continue;
+		chars.push(ch);
+		index.push(i);
+	}
+	return { text: chars.join(""), index };
+}
+
+export function tryReplace(
+	content: string,
+	oldString: string,
+	newString: string,
+	replaceAll: boolean,
+): ReplaceAttempt {
+	const exactOccurrences = content.split(oldString).length - 1;
+	if (exactOccurrences === 1 || (replaceAll && exactOccurrences > 0)) {
+		return {
+			updated: replaceAll ? content.split(oldString).join(newString) : content.replace(oldString, newString),
+			replacements: exactOccurrences,
+			fuzzy: false,
+		};
+	}
+	if (exactOccurrences > 1) return { updated: null, exactOccurrences };
+	const stripped = stripWhitespace(oldString);
+	if (stripped.text.length < MIN_FUZZY_CHARS) return { updated: null, exactOccurrences };
+	const flat = stripWhitespace(content);
+	const spans: Array<[number, number]> = [];
+	let from = 0;
+	for (;;) {
+		const at = flat.text.indexOf(stripped.text, from);
+		if (at === -1) break;
+		spans.push([flat.index[at] ?? 0, (flat.index[at + stripped.text.length - 1] ?? 0) + 1]);
+		from = at + stripped.text.length;
+		if (!replaceAll && spans.length > 1) break;
+	}
+	if (spans.length === 0 || (!replaceAll && spans.length > 1)) {
+		return { updated: null, exactOccurrences };
+	}
+	let updated = content;
+	for (let i = spans.length - 1; i >= 0; i--) {
+		const span = spans[i];
+		if (!span) continue;
+		updated = updated.slice(0, span[0]) + newString + updated.slice(span[1]);
+	}
+	return { updated, replacements: spans.length, fuzzy: true };
+}
+
 function buildNotFoundError(absolute: string, oldString: string, content: string): string {
 	const firstLine = (oldString.split("\n").find((l) => l.trim()) ?? oldString).trim();
 	const needle = firstLine.slice(0, 80);
@@ -52,19 +109,17 @@ export function createEditTool(cwd: string): AgentTool<typeof editSchema> {
 			await assertReadableFile(absolute);
 			const content = await readFile(absolute, "utf-8");
 
-			const occurrences = content.split(oldString).length - 1;
-			if (occurrences === 0) {
+			const attempt = tryReplace(content, oldString, newString, replaceAll ?? false);
+			if (attempt.updated === null) {
+				if (attempt.exactOccurrences > 1) {
+					throw new Error(
+						`old_string matched ${attempt.exactOccurrences} times in ${absolute}. Provide more surrounding context to make it unique, or set replaceAll: true.`,
+					);
+				}
 				throw new Error(buildNotFoundError(absolute, oldString, content));
 			}
-			if (!replaceAll && occurrences > 1) {
-				throw new Error(
-					`old_string matched ${occurrences} times in ${absolute}. Provide more surrounding context to make it unique, or set replaceAll: true.`,
-				);
-			}
-
-			const updated = replaceAll
-				? content.split(oldString).join(newString)
-				: content.replace(oldString, newString);
+			const updated = attempt.updated;
+			const occurrences = attempt.replacements;
 			await writeFile(absolute, updated, "utf-8");
 
 			const contextLines: string[] = [];
@@ -76,6 +131,7 @@ export function createEditTool(cwd: string): AgentTool<typeof editSchema> {
 			}
 			return {
 				content:
+					(attempt.fuzzy ? "(whitespace-insensitive match) " : "") +
 					`Applied edit to ${absolute} (${occurrences} replacement${occurrences > 1 ? "s" : ""}).\n` +
 					`Context:\n${contextLines.map((l) => `  ${l}`).join("\n")}`,
 				details: { path: absolute, replacements: occurrences },

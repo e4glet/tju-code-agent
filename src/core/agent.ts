@@ -5,6 +5,7 @@ import type {
 	AgentContext,
 	AgentEvent,
 	AgentLoopConfig,
+	AgentProviderState,
 	AgentTool,
 	AgentToolResult,
 	AfterToolCallContext,
@@ -38,6 +39,13 @@ export interface AgentOptions {
 	afterToolCall?: (context: AfterToolCallContext, signal?: AbortSignal) => Promise<AgentToolResult | undefined>;
 	/** Turn-level self-correction hook. Defaults to {@link createSelfCorrection}. */
 	afterTurn?: AgentLoopConfig["afterTurn"];
+	/**
+	 * Pre-existing provider state to adopt instead of creating a private one.
+	 * Components built from this agent (the sub-agent tool) should be handed
+	 * {@link Agent.provider} so they follow {@link Agent.setModel} /
+	 * {@link Agent.setProvider} at runtime.
+	 */
+	provider?: AgentProviderState;
 }
 
 /** Snapshot of the agent transcript and runtime state. */
@@ -61,13 +69,16 @@ export type AgentListener = (event: AgentEvent, signal?: AbortSignal) => Promise
  */
 export class Agent {
 	private systemPrompt: string;
-	private model: Model;
+	/**
+	 * The agent's live interface state. Exposed read-only so tool factories can
+	 * share it; replace it through {@link Agent.setModel} / {@link Agent.setProvider}.
+	 */
+	readonly provider: AgentProviderState;
 	private tools: AgentTool[];
 	private messages: Message[] = [];
 	private isStreaming = false;
 	private streamingMessage?: Message;
 	private errorMessage?: string;
-	private apiKey?: string;
 	private maxTokens?: number;
 	private temperature?: number;
 	private maxContextTokens?: number;
@@ -85,9 +96,8 @@ export class Agent {
 
 	constructor(options: AgentOptions) {
 		this.systemPrompt = options.systemPrompt ?? "";
-		this.model = options.model;
+		this.provider = options.provider ?? { model: options.model, apiKey: options.apiKey };
 		this.tools = options.tools?.slice() ?? [];
-		this.apiKey = options.apiKey;
 		this.maxTokens = options.maxTokens;
 		this.temperature = options.temperature;
 		this.maxContextTokens = options.maxContextTokens;
@@ -103,7 +113,7 @@ export class Agent {
 	get state(): AgentState {
 		return {
 			systemPrompt: this.systemPrompt,
-			model: this.model,
+			model: this.provider.model,
 			tools: this.tools.slice(),
 			messages: this.messages.slice(),
 			isStreaming: this.isStreaming,
@@ -114,7 +124,18 @@ export class Agent {
 
 	/** Set the model for subsequent turns. */
 	setModel(model: Model): void {
-		this.model = model;
+		this.provider.model = model;
+	}
+
+	/**
+	 * Switch the whole interface at once: API kind, endpoint, model id and the
+	 * key to use. Keeps derived components (sub-agent, context compaction) on
+	 * the same interface instead of letting them drift to the previous one.
+	 */
+	setProvider(next: AgentProviderState): void {
+		this.provider.model = next.model;
+		this.provider.apiKey = next.apiKey;
+		this.provider.entryId = next.entryId;
 	}
 
 	/** Replace the tool set for subsequent turns. */
@@ -223,8 +244,8 @@ export class Agent {
 
 	private createLoopConfig(): AgentLoopConfig {
 		return {
-			model: this.model,
-			apiKey: this.apiKey,
+			model: this.provider.model,
+			apiKey: this.provider.apiKey,
 			maxTokens: this.maxTokens,
 			temperature: this.temperature,
 			systemPrompt: this.systemPrompt,
@@ -232,11 +253,15 @@ export class Agent {
 			beforeToolCall: this.beforeToolCall,
 			afterToolCall: this.afterToolCall,
 			maxTurns: this.maxTurns,
+			// Renewal source: while the shared todo list still has open items the
+			// loop may extend its own budget a bounded number of times. Read lazily
+			// so it always reflects the model's latest todowrite state.
+			hasPendingWork: () => this.todoStore?.todos.some((t) => t.status !== "completed") ?? false,
 			afterTurn: this.afterTurn ?? createSelfCorrection(),
 			transformContext: async (messages, signal, options) => {
 				const result = await compactTranscript(messages, {
-					model: this.model,
-					apiKey: this.apiKey,
+					model: this.provider.model,
+					apiKey: this.provider.apiKey,
 					systemPrompt: this.systemPrompt,
 					tools: this.tools,
 					maxContextTokens: this.maxContextTokens,

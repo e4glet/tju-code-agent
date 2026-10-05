@@ -24,7 +24,7 @@ function render(word: string): string {
 	return rows.map((r) => r.trimEnd()).join("\n");
 }
 
-export function formatBanner(provider: string, model: string, cwd: string): string {
+export function formatBanner(provider: string, model: string, cwd: string, dataRoot: string): string {
 	return [
 		"",
 		`\u001b[36m${render("TJU CODE")}\u001b[0m`,
@@ -32,10 +32,11 @@ export function formatBanner(provider: string, model: string, cwd: string): stri
 		`\u001b[90m${APP_NAME} v${APP_VERSION} - a coding agent (model ${provider}/${model})\u001b[0m`,
 		`Commands: /help /status /model /clear /abort /exit`,
 		`cwd: ${cwd}`,
+		`data: ${dataRoot}`,
 		"",
 	].join("\n");
 }
 
-export function printBanner(provider: string, model: string, cwd: string): void {
-	process.stdout.write(formatBanner(provider, model, cwd) + "\n");
+export function printBanner(provider: string, model: string, cwd: string, dataRoot: string): void {
+	process.stdout.write(formatBanner(provider, model, cwd, dataRoot) + "\n");
 }

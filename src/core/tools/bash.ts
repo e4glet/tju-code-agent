@@ -51,8 +51,33 @@ const WINDOWS_UNIX_HINTS: Record<string, string> = {
 
 const NOT_RECOGNIZED_RE = /'([^']+)' is not recognized as an internal or external command/i;
 
+const MAX_ERROR_OUTPUT = 4000;
+
+function shortenErrorOutput(output: string): string {
+	const text = output.trim() || "(no output)";
+	if (text.length <= MAX_ERROR_OUTPUT) return text;
+	return `${text.slice(0, MAX_ERROR_OUTPUT)}\n...[error output truncated, kept first ${MAX_ERROR_OUTPUT} chars]`;
+}
+
+function errorHeader(command: string, workdir: string): string {
+	const cmd = command.length > 500 ? `${command.slice(0, 500)}...[truncated]` : command;
+	return `Failed command:\n  cwd: ${workdir}\n  command: ${cmd}`;
+}
+
+function errorFooter(output: string): string {
+	if (output.trim()) return "";
+	return "The command produced no output, so the exit code is the only clue. Re-run with explicit output (echo markers, dir/type to confirm paths) instead of retrying blindly.";
+}
+
 /** Build a friendly hint when cmd.exe reports an unrecognized command (exit 9009). */
 function windowsCommandHint(exitCode: number | null, output: string): string | null {
+	if (/was unexpected at this time/i.test(output)) {
+		return (
+			"HINT: this is a cmd.exe batch parsing error (the command runs inside a temporary .bat file, " +
+			"where loop variables need double percent signs). Rewrite `for %f` as `for %%f`, quote paths with " +
+			"spaces, or avoid `for` loops entirely with PowerShell."
+		);
+	}
 	const m = NOT_RECOGNIZED_RE.exec(output);
 	const name = m ? m[1] : null;
 	if (!name) return null;
@@ -192,15 +217,18 @@ export function createBashTool(cwd: string, options: BashToolOptions = {}): Agen
 			);
 
 			const output = captured.trim() || "(no output)";
+			const errBody = shortenErrorOutput(captured);
+			const header = errorHeader(input.command, workdir);
 			if (call.signal?.aborted) {
 				throw new Error("Command aborted");
 			}
 			if (timedOut) {
-				throw new Error(`Command timed out after ${input.timeout ?? 0} seconds.\n${output}`);
+				throw new Error(`${header}\nCommand timed out after ${input.timeout ?? 0} seconds.\n${errBody}`);
 			}
 			if (exitCode !== 0) {
 				const hint = isWindows ? windowsCommandHint(exitCode, output) : null;
-				throw new Error(`Command exited with code ${exitCode}.\n${output}${hint ? "\n" + hint : ""}`);
+				const footer = errorFooter(output);
+				throw new Error(`${header}\nCommand exited with code ${exitCode}.\n${errBody}${hint ? `\n${hint}` : ""}${footer ? `\n${footer}` : ""}`);
 			}
 			return await finalizeResult(captured, dropped, output);
 		},

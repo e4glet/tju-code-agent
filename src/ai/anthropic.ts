@@ -132,6 +132,7 @@ async function toAnthropicMessages(context: Context): Promise<unknown[]> {
 
 /** Thinking-token budgets per effort level; `max` is clamped by max_tokens anyway. */
 const THINKING_BUDGETS = { low: 2048, high: 16384, max: 32768 } as const;
+const MIN_VISIBLE_TOKENS = 2048;
 
 async function runStream(
 	stream: EventStream<GroundEvent>,
@@ -160,7 +161,7 @@ async function runStream(
 	}
 
 	const baseUrl = (options?.baseUrl ?? model.baseUrl ?? "https://api.anthropic.com").replace(/\/$/, "");
-	const maxTokens = options?.maxTokens ?? model.maxTokens ?? 4096;
+	let maxTokens = options?.maxTokens ?? model.maxTokens ?? 4096;
 	const body: Record<string, unknown> = {
 		model: model.id,
 		max_tokens: maxTokens,
@@ -184,9 +185,15 @@ async function runStream(
 		if (effort === "none") {
 			body.thinking = { type: "disabled" };
 		} else {
-			// The API rejects budget_tokens >= max_tokens, so clamp it while
-			// keeping the documented minimum of 1024.
-			const budget = Math.min(THINKING_BUDGETS[effort], Math.max(1024, maxTokens - 1));
+			if (options?.maxTokens === undefined && model.maxTokens === undefined) {
+				maxTokens = Math.max(maxTokens, THINKING_BUDGETS[effort] + MIN_VISIBLE_TOKENS);
+				body.max_tokens = maxTokens;
+			}
+			const budget = Math.min(
+				THINKING_BUDGETS[effort],
+				Math.max(1024, maxTokens - MIN_VISIBLE_TOKENS),
+				maxTokens - 1,
+			);
 			body.thinking = {
 				type: "enabled",
 				budget_tokens: budget,

@@ -6,6 +6,8 @@
 
 ![alt text](image-2.png)
 
+![alt text](image-3.png)
+
 ## 特性
 
 - 双层 agent 循环（外层 turn 循环 + 内层 provider 流式读取），天然适配流式 UI。
@@ -54,10 +56,6 @@ npm install
 | `deepseek` | https://api.deepseek.com | `deepseek-v4-flash` | `DEEPSEEK_API_KEY` |
 | `kimi` | https://api.moonshot.cn/v1 | `moonshot-v1-8k` | `MOONSHOT_API_KEY` |
 | `qwen` | https://dashscope.aliyuncs.com/compatible-mode/v1 | `qwen-max` | `DASHSCOPE_API_KEY` |
-| `glm` | https://open.bigmodel.cn/api/paas/v4 | `glm-4-plus` | `ZHIPU_API_KEY` |
-| `amd` | https://developer.amd.com.cn/radeon/api/v1 | `DeepSeek-V4-Flash` | `AI_API_KEY` |
-
-AMD Cloud 还可通过 `AI_API_URL` 覆盖接口地址、`AI_MODEL` 覆盖模型名。
 
 推荐使用`deepseek v4 flash 0731`。
 
@@ -74,18 +72,6 @@ bash：
 ```bash
 export DEEPSEEK_API_KEY=sk-你的key
 npm run dev:gui -- --profile deepseek
-```
-
-AMD Cloud 示例：
-
-```powershell
-$env:AI_API_KEY = "你的key"
-npm run dev:gui -- --profile amd
-```
-
-```bash
-export AI_API_KEY=你的key
-npm run dev -- --profile amd
 ```
 
 预设的参数都可单独覆盖，例如换更强的模型：
@@ -123,14 +109,39 @@ npm run dev -- `
 | `deepseek` | `DEEPSEEK_API_KEY` | `DEEPSEEK_BASE_URL` | 仅 `--model` |
 | `kimi` | `MOONSHOT_API_KEY` | `MOONSHOT_BASE_URL` | 仅 `--model` |
 | `qwen` | `DASHSCOPE_API_KEY` | `DASHSCOPE_BASE_URL` | 仅 `--model` |
-| `glm` | `ZHIPU_API_KEY` | `ZHIPU_BASE_URL` | 仅 `--model` |
-| `amd` | `AI_API_KEY` | `AI_API_URL` | `AI_MODEL` |
 
-其中：AMD 支持全环境变量覆盖（接口/模型/key），其余预设的模型名只能通过 `--model` 修改。
+各预设的模型名只能通过 `--model` 修改。
 
 ### 方式三：环境变量
 
 OpenAI 兼容接口用 `OPENAI_API_KEY` / `OPENAI_BASE_URL`，Anthropic 用 `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL`；厂商预设还有各自的 `<厂商>_API_KEY`（见上表）。
+
+### 方式四：图形界面里管理接口（推荐给非命令行用户）
+
+打开 GUI → 左下角**设置**齿轮 → **接口**页签，可以**新增 / 修改 / 删除**任意接口（名称、协议 OpenAI 兼容 / Anthropic、接口地址、默认模型、API key），点「测试连接」会真实请求 `/models` 校验地址与 key；点「使用」把该接口设为当前接口（输入框右侧的下拉框也能随时切换）。
+
+配置存放在本机两个**纯文本文件**（就是"内置的那份本地 json"）：
+
+| 文件 | 内容 |
+| --- | --- |
+| `~/.tju-code/providers.json` | 接口条目（id / 显示名 / 协议 / 地址 / 默认模型），带 `schemaVersion` |
+| `~/.tju-code/secrets.json` | 每个接口的 API key（Windows 下按当前用户账户隔离，仅本机可读） |
+
+**key 只存在 `secrets.json` 里，不会写进 `providers.json`。**
+
+内置的厂商预设（deepseek / kimi / qwen）是**只读**的；想改内置预增设的默认地址或模型，编辑它会生成一条**同 id 的用户覆盖**，删除该覆盖即恢复内置默认。
+
+#### 双击启动脚本（.bat）的行为
+
+仓库根目录的 `启动.bat` / `启动-gui.bat` 顶部 CONFIG 区可以填 `API_KEY` / `BASE_URL` / `MODEL`：
+
+1. **第一次双击**：脚本里的 `BASE_URL` / `API_KEY` / `MODEL` 会被**自动导入**成本机接口（第一个叫 `启动脚本`，之后的不同地址/模型叫 `启动脚本·xxx`），存进本机 `providers.json` + `secrets.json`，并自动切到它。
+2. **之后双击同一个脚本**：以本机保存的配置为准——你在「设置 → 接口」里对它的任何修改都会被保留（脚本不再覆盖），因此不会每次启动都把你的改动冲掉。
+3. **多个脚本累加**：按"地址 + 模型"区分，每个不同的组合各存一条、互不覆盖；双击哪个脚本就自动选中它对应的条目。同地址多模型（如同平台的三个模型各一个 bat）同样各存一条。
+4. **完全没有配置过的脚本**（CONFIG 区留空）：**依然可以正常启动**，GUI 会打开「设置 → 接口」并提示先配置；在界面里填好接口和 key 后就能直接对话，不需要再改脚本。
+
+> 想让脚本参数**始终优先**（不走导入、每次以脚本为准），在脚本里显式加 `--profile <接口id>` 即可。
+> 在界面里**删除**了 `启动脚本` 这个接口，但脚本里 `BASE_URL` 还填着：下次双击会**重新导入**（"双击带配置的脚本"即视为你要用它）。想永久弃用，把脚本 CONFIG 区的 `BASE_URL` 清空即可。
 
 ### 多工作项
 
@@ -212,12 +223,21 @@ CLI 在模型思考（未输出正文）时会显示一行灰色 `[思考中...]
 
 ### GUI 发送方式与设置
 
-右上角设置齿轮（⚙）打开设置弹窗，目前含一项：
+右上角设置齿轮（⚙）打开设置弹窗，分「通用 / 更新」两个页签：
 
 - **Enter 发送**（默认关闭）：勾选后按 `Enter` 直接发送、`Shift+Enter` 换行；不勾选时按 `Ctrl`（macOS 为 `Cmd`）+ `Enter` 发送。选择即时生效并持久化到 `localStorage`（`tju.gui.enterSend`），输入框 placeholder 会同步提示当前快捷键。
 - 中文输入法组合态（IME composing）下按 Enter 只确认候选词，不会误发送。
 
 运行中的「停止」入口在**发送按钮本身**：运行期间发送按钮变为停止图标，点击即中止当前 run（不再单独设顶栏中止按钮）。
+
+### GUI 自更新
+
+`dist/` 即发行版。配好更新源后，点设置 → 更新页签即可一键升级，无需手动拷文件：
+
+- **前置条件**：用发行版 `dist` 启动（源码 `tsx` 运行会拒绝更新）；启动时配好更新源地址（二选一）：启动脚本 CONFIG 区填 `UPDATE_URL`，或 `--update-url <地址>` / 环境变量 `TJU_UPDATE_URL`。
+- **使用流程**：设置 → 更新 →「检查更新」（发现新版出现「立即更新」）→ 点更新（按钮变灰显示"更新中…"，下载校验替换）→ 出现「重启服务」→ 点它（旧窗口会提示可直接关闭）→ 点「刷新页面」。另有「回滚上一版」（`dist.bak` 单级备份，可反复横跳），同样走"替换→重启"两步。
+- **规则**：任务执行中点更新/回滚/重启会被 409 拒绝（等本轮结束）；更新只换文件不生效，必须重启；重启后会话 token 轮换，旧页面调接口全 403，所以更新完要点"刷新页面"；按钮在操作进行中自动禁用防连点。
+- **发版流程**（维护者）：改 `package.json` 版本号 → `npm run build`（版本号此刻 baked 进包，**改号后必须重新 build 再 pack**）→ `npm run pack:update`（生成 `update/`：`latest.json` + 版本全量文件）→ 把 `update/` 传到静态服务器。客户端用"检查更新"验证 manifest 可达后再通知用户升级。
 
 #### 运行中注入引导（steering）
 
@@ -333,13 +353,14 @@ npm test
 
    | 变量 | 默认 | 说明 |
    | --- | --- | --- |
-   | `API_KEY` | 空 | 你的 API Key（必填） |
-   | `BASE_URL` | 空 | 接口地址（留空用默认，URL 含 `anthropic` 自动走 Anthropic 协议，否则 OpenAI） |
+   | `API_KEY` | 空 | 你的 API Key（**首次双击**会导入到本机配置，之后可在「设置 → 接口」里改） |
+   | `BASE_URL` | 空 | 接口地址（**留空也能启动**，进界面里配置即可；URL 含 `anthropic` 自动走 Anthropic 协议，否则 OpenAI） |
    | `MODEL` | 空 | 模型名（留空用默认） |
    | `WORKDIR` | 空 | 智能体的工作目录（留空 = 脚本所在目录） |
    | `PORT` | `9399` | GUI 端口（仅 gui 脚本） |
 
    > bat 脚本双击运行，结束/报错时会 `pause` 等待按键；路径含中文可正常使用（脚本已 `chcp 65001` 切 UTF-8）。
+   > 脚本里的 `API_KEY` / `BASE_URL` 是**首次导入**用的引导值：导入后以本机 `~/.tju-code/providers.json` 为准，界面里的修改不会被下次双击覆盖（详见上文「方式四」）。
 
 - **库（dist/index.js + index.d.ts）**：作为编程接口被其他项目引用。
 
@@ -367,7 +388,7 @@ Commands:
 
 Flags:
   --api <openai-completions|anthropic-messages>
-  --profile <deepseek|kimi|qwen|glm|amd>
+  --profile <deepseek|kimi|qwen>
   --provider <id>     --model <id>
   --api-key <key>     --base-url <url>
   --no-thinking       关闭思考模式（默认开启）
@@ -375,12 +396,13 @@ Flags:
   --max-context-tokens <n>  上下文预算（默认 128000，超出自动压缩）
   --max-turns <n>      每轮 run 的最大 turn 数（默认 50，超出强制收尾）
   --port <n>（gui）   --no-open
+  --update-url <url> 自更新源地址（GUI 设置→更新页用；也可配 TJU_UPDATE_URL）
   --log-dir <path>     运行事件日志目录（默认 ~/.tju-code/logs）
   --log-retention <n>  事件日志保留天数（默认 7）
   --session-dir <path> 工作项持久化目录（默认 ~/.tju-code/works）
 ```
 
-环境变量：`OPENAI_API_KEY` / `OPENAI_BASE_URL` / `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL`，厂商预设各自的 `<厂商>_API_KEY`，以及 AMD 的 `AI_API_KEY` / `AI_API_URL` / `AI_MODEL`。
+环境变量：`OPENAI_API_KEY` / `OPENAI_BASE_URL` / `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL`，厂商预设各自的 `<厂商>_API_KEY`。
 
 ## 架构
 

@@ -28,7 +28,9 @@ function isContextOverflow(message: AssistantMessage): boolean {
 	return CONTEXT_OVERFLOW_RE.test(error);
 }
 
-const MAX_STEPS_PROMPT = `CRITICAL - MAXIMUM STEPS REACHED
+export const TURN_CAP_MARKER = "CRITICAL - MAXIMUM STEPS REACHED";
+
+const MAX_STEPS_PROMPT = `${TURN_CAP_MARKER}
 
 The maximum number of steps allowed for this task has been reached. Tools are disabled until next user input. Respond with text only.
 
@@ -46,6 +48,20 @@ Response must include:
 Any attempt to use tools is a critical violation. Respond with text ONLY.`;
 
 type AgentPrompt = Message | string;
+
+const DEFAULT_MAX_TURNS = 50;
+
+/**
+ * True for the step-cap instruction left in the transcript by older versions,
+ * which pushed it as a real user message (see the cap branch in runLoop).
+ */
+function isLegacyTurnCapNotice(content: unknown): boolean {
+	return typeof content === "string" && content.trimStart().startsWith(TURN_CAP_MARKER);
+}
+/** Extra turns granted when the plan still has open items. */
+const TURN_RENEWAL_SIZE = 25;
+/** Hard ceiling on renewals, so an unfinished plan can never loop forever. */
+const MAX_TURN_RENEWALS = 2;
 
 /**
  * Run the agent loop starting with new prompt messages.
@@ -105,25 +121,51 @@ async function runLoop(
 	newMessages: Message[],
 	emit: (event: AgentEvent) => Promise<void> | void,
 ): Promise<void> {
-	const maxTurns = config.maxTurns ?? 50;
+	let maxTurns = config.maxTurns ?? DEFAULT_MAX_TURNS;
+	let renewals = 0;
 	let turnCount = 0;
+	const hasOpenWork = (): boolean => {
+		try {
+			return config.hasPendingWork?.() === true;
+		} catch {
+			return false;
+		}
+	};
 	while (true) {
 		turnCount++;
 		if (turnCount > maxTurns) {
-			// Turn budget exhausted: give the model one last text-only turn to
-			// hand off the work, then stop unconditionally so a misbehaving
-			// model cannot loop forever.
-			const capMessage: UserMessage = {
-				role: "user",
-				content: MAX_STEPS_PROMPT,
-				timestamp: Date.now(),
-			};
-			context.messages.push(capMessage);
-			newMessages.push(capMessage);
-			await emit({ type: "message_start", message: capMessage });
-			await emit({ type: "message_end", message: capMessage });
+			// The plan still has open items: extend the budget instead of cutting
+			// the run off mid-plan. The model is not told about it, it just keeps
+			// working. Bounded by MAX_TURN_RENEWALS so a stuck plan still stops.
+			if (renewals < MAX_TURN_RENEWALS && hasOpenWork()) {
+				renewals++;
+				maxTurns += TURN_RENEWAL_SIZE;
+				await emit({
+					type: "notice",
+					level: "warn",
+					message: `任务清单仍有未完成项，已自动延长本轮步数上限 +${TURN_RENEWAL_SIZE} 步（第 ${renewals}/${MAX_TURN_RENEWALS} 次，当前上限 ${maxTurns} 步）。`,
+				});
+				continue;
+			}
 
-			const finalMessage = await streamAssistantResponse(context, config, signal, emit, true);
+			// Budget exhausted: ask for one last text-only turn to hand off the work,
+			// then stop unconditionally so a misbehaving model cannot loop forever.
+			// The instruction is handed to the provider as an ephemeral final message
+			// (see streamAssistantResponse) and deliberately never enters the
+			// transcript: a persisted "tools are disabled" user message would show up
+			// as a user bubble, contradict every later request, and poison the
+			// context until compaction happens to drop it.
+			const planOpen = hasOpenWork();
+			await emit({
+				type: "notice",
+				level: "warn",
+				message: planOpen
+					? `已达本轮步数上限（${maxTurns} 步）且自动续期已用尽，但任务清单仍有未完成项。已要求模型停止调用工具并汇总进度；发送新消息即可继续执行。`
+					: `已达本轮步数上限（${maxTurns} 步）。已要求模型停止调用工具并汇总进度；发送新消息即可继续执行。`,
+			});
+
+			await emit({ type: "turn_start" });
+			const finalMessage = await streamAssistantResponse(context, config, signal, emit, true, MAX_STEPS_PROMPT);
 			newMessages.push(finalMessage);
 			await emit({ type: "turn_end", message: finalMessage, toolResults: [] });
 			return;
@@ -241,6 +283,7 @@ async function streamAssistantResponse(
 	signal: AbortSignal | undefined,
 	emit: (event: AgentEvent) => Promise<void> | void,
 	disableTools = false,
+	finalInstruction?: string,
 ): Promise<AssistantMessage> {
 	let overflowRetried = false;
 	for (;;) {
@@ -259,9 +302,30 @@ async function streamAssistantResponse(
 			}
 		}
 
+		// Older versions pushed the step-cap instruction into the transcript as a
+		// real user message, so it is persisted in existing work items and would
+		// otherwise be replayed on every later request as a standing "do not call
+		// tools" instruction. Drop it on the way out (the stored transcript is left
+		// untouched) and keep the original array identity when there is nothing to
+		// strip, so the provider prefix cache stays stable.
+		const transcript = messages.some((m) => m.role === "user" && isLegacyTurnCapNotice(m.content))
+			? messages.filter((m) => !(m.role === "user" && isLegacyTurnCapNotice(m.content)))
+			: messages;
+
+		// An ephemeral instruction is appended *after* context transformation and
+		// after the legacy scrub, so it is always the last message, cannot be
+		// compacted away, and can never be mistaken for (or removed by) the
+		// transcript-level cleanup above.
+		const providerMessages = finalInstruction
+			? [
+					...transcript,
+					{ role: "user", content: finalInstruction, timestamp: Date.now() } satisfies UserMessage,
+				]
+			: transcript;
+
 		const providerContext: Context = {
 			systemPrompt: context.systemPrompt || config.systemPrompt,
-			messages,
+			messages: providerMessages,
 			tools: disableTools
 				? undefined
 				: context.tools?.map((t) => ({

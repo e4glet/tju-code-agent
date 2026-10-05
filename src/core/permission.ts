@@ -16,7 +16,7 @@ export interface ApprovalGateOptions {
 	ask: (request: ApprovalRequest) => boolean | "always" | Promise<boolean | "always">;
 }
 
-const FILE_TOOLS = new Set(["read", "write", "edit", "grep"]);
+const FILE_TOOLS = new Set(["read", "write", "edit", "grep", "glob"]);
 
 // A drive path must be a standalone token: the drive letter cannot be glued to
 // a preceding word char, otherwise protocol strings like `redis://` or

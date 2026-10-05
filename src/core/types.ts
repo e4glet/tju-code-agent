@@ -21,6 +21,18 @@ export interface Model {
 	reasoningEffort?: ReasoningEffort;
 }
 
+/**
+ * Live provider state of a running agent: the interface (API kind, endpoint)
+ * plus the selected model and the key used for it. Held as one mutable object
+ * so that components derived from an agent (the sub-agent tool, context
+ * compaction) read the current interface instead of a creation-time snapshot.
+ */
+export interface AgentProviderState {
+	model: Model;
+	apiKey?: string;
+	entryId?: string;
+}
+
 export interface TextContent {
 	type: "text";
 	text: string;
@@ -229,6 +241,13 @@ export interface AgentLoopConfig {
 	afterTurn?: (context: AfterTurnContext) => Promise<string | null>;
 	/** Maximum assistant turns per run. When exceeded, the loop injects a final summary turn and stops. Defaults to 50. */
 	maxTurns?: number;
+	/**
+	 * Reports whether planned work (the session todo list) still has unfinished
+	 * items. While it returns true the turn budget is renewed automatically
+	 * instead of ending the run, up to an internal hard ceiling. Omit to disable
+	 * renewal (the budget then behaves as a plain cap).
+	 */
+	hasPendingWork?: () => boolean;
 	/** Returns steering messages to inject mid-run (for example while a tool is executing). */
 	getSteeringMessages?: () => Promise<AgentMessage[]>;
 	/** Returns follow-up messages to process after the agent would otherwise stop. */
@@ -249,4 +268,9 @@ export type AgentEvent =
 	| { type: "message_end"; message: Message }
 	| { type: "tool_start"; toolCallId: string; toolName: string; args: unknown }
 	| { type: "tool_update"; toolCallId: string; toolName: string; partialContent: string }
-	| { type: "tool_end"; toolCallId: string; toolName: string; result: AgentToolResult; isError: boolean };
+	| { type: "tool_end"; toolCallId: string; toolName: string; result: AgentToolResult; isError: boolean }
+	/**
+	 * Out-of-band status notice for the UI (turn-budget renewal, hard cap, ...).
+	 * Purely informational: it is never part of the provider transcript.
+	 */
+	| { type: "notice"; level: "info" | "warn"; message: string };

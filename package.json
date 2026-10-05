@@ -1,6 +1,6 @@
 {
 	"name": "tju-code",
-	"version": "0.1.0",
+	"version": "0.1.14",
 	"private": true,
 	"description": "A coding agent framework with a terminal CLI and an in-browser GUI, inspired by the pi agent harness architecture.",
 	"type": "module",
@@ -17,6 +17,7 @@
 		"dev": "tsx src/cli.ts",
 		"dev:gui": "tsx src/cli.ts gui",
 		"build": "tsup",
+		"pack:update": "node scripts/pack-update.mjs",
 		"typecheck": "tsc --noEmit",
 		"test": "vitest run",
 		"prepublishOnly": "npm run typecheck && npm run test && npm run build"

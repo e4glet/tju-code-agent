@@ -90,6 +90,7 @@ export const VIEW_HTML = `<!DOCTYPE html>
               <button class="effort-opt" data-effort="high" title="high：开启思考模式，强度 high（默认）">high</button>
               <button class="effort-opt" data-effort="max" title="max：开启思考模式，强度 max">max</button>
             </div>
+            <select id="provider-select" class="provider-select"></select>
           </div>
           <button id="steer-btn" class="steer-btn" title="注入引导（Enter）" type="button" hidden>
             <svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M2 8H10.5M10.5 8L7 4.5M10.5 8L7 11.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/><path d="M13.5 3V13" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
@@ -158,6 +159,7 @@ export const VIEW_HTML = `<!DOCTYPE html>
     <div class="modal-title" id="settings-title">设置</div>
     <div class="tab-switch settings-tabs">
       <button id="settings-tab-general" class="tab-btn active">通用</button>
+      <button id="settings-tab-providers" class="tab-btn">接口</button>
       <button id="settings-tab-update" class="tab-btn">更新</button>
     </div>
     <div id="settings-pane-general">
@@ -168,6 +170,40 @@ export const VIEW_HTML = `<!DOCTYPE html>
         </span>
         <input type="checkbox" id="opt-enter-send" class="settings-check" />
       </label>
+      <div class="settings-row">
+        <span class="settings-label">
+          <span class="settings-name">当前接口 <span class="update-ver" id="provider-current">-</span></span>
+          <span class="settings-hint" id="provider-current-detail">加载中…</span>
+        </span>
+      </div>
+    </div>
+    <div id="settings-pane-providers" hidden>
+      <div class="provider-help" id="provider-help">内置接口只读；编辑内置接口会生成一条同 id 的自定义覆盖，删除该覆盖即恢复内置默认。key 保存在本机数据目录（<span class="provider-help-code" id="provider-help-data-dir">~/.tju-code</span>）下的 <span class="provider-help-code">secrets.json</span>。</div>
+      <div id="provider-list"></div>
+      <div class="settings-row provider-form" id="provider-form" hidden>
+        <span class="settings-label">
+          <span class="settings-name" id="provider-form-title">新增接口</span>
+          <input class="modal-input provider-input" id="provider-f-id" placeholder="id（英文字母/数字/横线，如 my-gateway）" />
+          <input class="modal-input provider-input" id="provider-f-label" placeholder="显示名（如 自建中转）" />
+          <div class="provider-api-row">
+            <button class="modal-btn provider-api-btn" data-api="openai-completions">OpenAI 兼容</button>
+            <button class="modal-btn provider-api-btn" data-api="anthropic-messages">Anthropic</button>
+          </div>
+          <input class="modal-input provider-input" id="provider-f-baseUrl" placeholder="接口地址，如 https://xxx/v1" />
+          <input class="modal-input provider-input" id="provider-f-model" placeholder="默认模型 ID" />
+          <input class="modal-input provider-input" id="provider-f-keyEnv" placeholder="key 的环境变量名（可选，如 MY_API_KEY）" />
+          <input class="modal-input provider-input" id="provider-f-key" type="password" placeholder="API key（可选，只写不显；留空则用环境变量）" autocomplete="off" />
+          <span class="settings-hint" id="provider-form-status"></span>
+          <span class="provider-form-actions">
+            <button class="modal-btn" id="provider-f-test" type="button">测试连接</button>
+            <button class="modal-btn primary" id="provider-f-save" type="button">保存</button>
+            <button class="modal-btn" id="provider-f-cancel" type="button">取消</button>
+          </span>
+        </span>
+      </div>
+      <div class="update-actions">
+        <button id="btn-provider-add" class="modal-btn">新增接口</button>
+      </div>
     </div>
     <div id="settings-pane-update" hidden>
       <div class="settings-row">
@@ -381,6 +417,19 @@ li { margin: 4px 0; }
 .conversation { flex: 1; overflow-y: auto; padding: 24px 20px 8px; }
 .conv-inner { width: 100%; max-width: 788px; margin: 0 auto; min-height: 100%; display: flex; flex-direction: column; gap: 14px; }
 .conv-inner > * { flex-shrink: 0; }
+.sys-notice {
+  align-self: center;
+  max-width: 100%;
+  padding: 6px 12px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.6;
+  text-align: center;
+}
+.sys-notice.warn { background: rgba(217, 130, 43, 0.1); border-color: rgba(217, 130, 43, 0.32); color: var(--warn); }
 .empty-card {
   position: relative; align-self: center; text-align: center; margin: auto; color: var(--muted);
   max-width: 440px; padding: 32px 24px;
@@ -617,9 +666,21 @@ li { margin: 4px 0; }
   background: var(--panel); border-color: var(--border);
   box-shadow: var(--shadow);
 }
-.user-nav-scroll { overflow: hidden; padding: 10px 0; box-sizing: content-box; }
+.user-nav-scroll { overflow: hidden; padding: 10px 0; box-sizing: content-box; scrollbar-width: none; -ms-overflow-style: none; }
+.user-nav-scroll::-webkit-scrollbar { display: none; }
 .user-nav.open .user-nav-scroll { overflow-y: auto; }
-.user-nav.open .user-nav-scroll::-webkit-scrollbar { width: 6px; }
+.user-nav-scroll.can-down {
+  -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 14px), transparent);
+  mask-image: linear-gradient(to bottom, #000 calc(100% - 14px), transparent);
+}
+.user-nav-scroll.can-up {
+  -webkit-mask-image: linear-gradient(to bottom, transparent, #000 14px);
+  mask-image: linear-gradient(to bottom, transparent, #000 14px);
+}
+.user-nav-scroll.can-up.can-down {
+  -webkit-mask-image: linear-gradient(to bottom, transparent, #000 14px, #000 calc(100% - 14px), transparent);
+  mask-image: linear-gradient(to bottom, transparent, #000 14px, #000 calc(100% - 14px), transparent);
+}
 .user-nav-clip {
   position: relative; width: 100%; min-height: 30px;
 }
@@ -783,7 +844,7 @@ li { margin: 4px 0; }
 .modal-btn.primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); color: #fff; }
 .modal-btn.danger { background: var(--err); border-color: var(--err); color: #fff; font-weight: 600; }
 .modal-btn.danger:hover { filter: brightness(1.05); color: #fff; }
-.settings-modal { width: min(440px, 100%); }
+.settings-modal { width: min(660px, 100%); }
 .settings-tabs { margin-top: 14px; align-self: flex-start; }
 .settings-row {
   display: flex; align-items: flex-start; gap: 14px; cursor: pointer;
@@ -800,6 +861,66 @@ li { margin: 4px 0; }
   font-size: 12px; color: var(--muted); font-weight: 500;
 }
 .update-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.provider-help { margin-top: 12px; font-size: 12px; line-height: 1.6; color: var(--muted); }
+.provider-help-code {
+  font-family: "SF Mono", "JetBrains Mono", "Fira Code", Consolas, monospace;
+  font-size: 11px; color: var(--text); background: var(--code); padding: 1px 4px; border-radius: 4px;
+}
+#provider-list {
+  display: flex; flex-direction: column; gap: 8px; margin-top: 12px;
+  max-height: min(46vh, 420px); overflow-y: auto; padding-right: 2px;
+}
+.provider-warn {
+  font-size: 12px; line-height: 1.55; color: var(--warn); background: rgba(217, 130, 43, 0.1);
+  border: 1px solid rgba(217, 130, 43, 0.32); border-radius: 8px; padding: 8px 10px;
+}
+.provider-empty { color: var(--faint); font-size: 12px; text-align: center; padding: 14px 8px; }
+.provider-item {
+  display: flex; align-items: flex-start; gap: 10px; padding: 10px 12px;
+  border: 1px solid var(--border); border-radius: 10px; background: var(--bg);
+}
+.provider-item:hover { border-color: var(--accent); }
+.provider-item.current { border-color: var(--accent); background: var(--accent-soft); }
+.provider-item-body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+.provider-item-title { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; font-size: 13px; font-weight: 600; color: var(--text); }
+.provider-item-id {
+  font-family: "SF Mono", "JetBrains Mono", "Fira Code", Consolas, monospace;
+  font-size: 11px; font-weight: 500; color: var(--faint);
+}
+.provider-item-meta { font-size: 11px; line-height: 1.5; color: var(--muted); word-break: break-all; }
+.provider-item-actions { flex: none; display: flex; flex-direction: column; gap: 6px; align-items: stretch; }
+.provider-item-actions .modal-btn { padding: 3px 10px; font-size: 12px; }
+.provider-tag {
+  font-size: 10px; font-weight: 500; padding: 1px 7px; border-radius: 999px; white-space: nowrap;
+  border: 1px solid var(--border); background: var(--panel); color: var(--muted);
+}
+.provider-tag.ok { color: var(--ok); border-color: rgba(34, 160, 107, 0.35); }
+.provider-tag.warn { color: var(--warn); border-color: rgba(217, 130, 43, 0.35); }
+.provider-form .provider-input { width: 100%; }
+.provider-api-row { display: flex; gap: 6px; }
+.provider-api-btn.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+.provider-form-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+#provider-form-status { min-height: 17px; }
+#provider-form-status.err { color: var(--err); }
+#provider-form-status.ok { color: var(--ok); }
+.provider-select {
+  flex: 1 1 auto; min-width: 0; max-width: 250px; height: 30px;
+  padding: 0 28px 0 12px; border-radius: 999px;
+  border: 1px solid var(--border); color: var(--text);
+  font-size: 12px; font-family: inherit; cursor: pointer;
+  appearance: none; -webkit-appearance: none;
+  text-overflow: ellipsis; white-space: nowrap; overflow: hidden;
+  background-color: var(--bg);
+  background-image: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'><path d='M2.5 4.5 6 8l3.5-3.5' fill='none' stroke='%236f7683' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'/></svg>");
+  background-repeat: no-repeat; background-position: right 10px center; background-size: 12px 12px;
+  transition: border-color .15s ease, box-shadow .15s ease;
+}
+html[data-theme="dark"] .provider-select {
+  background-image: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'><path d='M2.5 4.5 6 8l3.5-3.5' fill='none' stroke='%23aab4c8' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'/></svg>");
+}
+.provider-select:hover { border-color: var(--accent); }
+.provider-select:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.settings-modal.wide { width: min(660px, 100%); max-height: calc(100vh - 40px); overflow-y: auto; }
 .traj-row-detail {
   margin: 0 10px 0 18px; padding: 8px 10px;
   border: 1px solid var(--border-strong); border-radius: 6px;
@@ -986,7 +1107,9 @@ var USER_NAV_PAD = 10;
 var USER_NAV_MIN = 2;
 var USER_NAV_LINE = 16;
 var USER_NAV_COLLAPSED_W = 48;
+var USER_NAV_STRIP_W = 34;
 var USER_NAV_TEXT_W = 230;
+var USER_NAV_COLLAPSED_ROWS = 9;
 var userNavEls = [];
 var userNavOpen = false;
 var userNavHoverOpen = false;
@@ -1012,8 +1135,8 @@ function navFullH() {
 }
 function applyUserNavSize() {
   if (!userNavScroll) return;
-  userNavScroll.style.maxHeight = navMaxH() + "px";
-  userNav.style.width = (userNavHoverOpen ? USER_NAV_TEXT_W + USER_NAV_COLLAPSED_W : USER_NAV_COLLAPSED_W) + "px";
+  userNavScroll.style.maxHeight = Math.min(navMaxH(), USER_NAV_PAD * 2 + USER_NAV_COLLAPSED_ROWS * USER_NAV_ITEM_H) + "px";
+  userNav.style.width = (userNavHoverOpen ? USER_NAV_TEXT_W + USER_NAV_COLLAPSED_W : USER_NAV_STRIP_W) + "px";
 }
 function navRender() {
   if (!userNav || !userNavList) return;
@@ -1056,7 +1179,14 @@ function paintUserNav() {
   }
   userNavClip.style.minHeight = (total * USER_NAV_ITEM_H + USER_NAV_PAD * 2) + "px";
   userNavList.replaceChildren(frag);
+  paintUserNavMask();
   computeUserNavActive();
+}
+function paintUserNavMask() {
+  if (!userNavScroll) return;
+  var st = userNavScroll.scrollTop;
+  userNavScroll.classList.toggle("can-up", st > 1);
+  userNavScroll.classList.toggle("can-down", st + userNavScroll.clientHeight < userNavScroll.scrollHeight - 1);
 }
 function paintUserNavActive() {
   for (var k = 0; k < userNavNodes.length; k++) {
@@ -1087,7 +1217,7 @@ function computeUserNavActive() {
   setUserNavActive(best >= 0 ? best : bestAny);
 }
 function scrollNavToActive() {
-  if (userNavActive < 0 || !userNavOpen || !userNavHoverOpen) return;
+  if (userNavActive < 0 || !userNavOpen) return;
   var viewH = userNavScroll.clientHeight;
   var fullH = navFullH();
   if (!viewH || fullH <= viewH) {
@@ -1108,15 +1238,21 @@ function setUserNavHover(open) {
   if (open) {
     applyUserNavSize();
     userNav.classList.add("open");
+    var perView = Math.max(1, Math.floor((userNavScroll.clientHeight - USER_NAV_PAD * 2) / USER_NAV_ITEM_H));
+    if (userNavActive >= Math.max(0, userNavEls.length - perView)) {
+      var max = navFullH() - userNavScroll.clientHeight;
+      if (max > 0) userNavScroll.scrollTop = max;
+      else if (userNavScroll.scrollTop !== 0) userNavScroll.scrollTop = 0;
+    } else {
+      scrollNavToActive();
+    }
     paintUserNav();
-    scrollNavToActive();
     return;
   }
   userNav.classList.remove("open");
   userNavCloseTimer = setTimeout(function () {
     userNavCloseTimer = null;
     applyUserNavSize();
-    if (userNavScroll.scrollTop !== 0) userNavScroll.scrollTop = 0;
     paintUserNav();
   }, 260);
 }
@@ -2016,6 +2152,21 @@ function bubble(cls, textOrHtml, isHtml, attachments) {
   return el;
 }
 
+// Out-of-band status line (turn-budget renewal / hard cap). Rendered as a
+// neutral notice instead of a fake user bubble, and stripped before the
+// conversation is persisted so a refresh cannot resurrect a stale one.
+function addNotice(text, level) {
+  var emptyEl = conversation.querySelector(".empty-card");
+  if (emptyEl) emptyEl.remove();
+  var el = document.createElement("div");
+  el.className = "sys-notice" + (level === "warn" ? " warn" : "");
+  el.textContent = String(text || "");
+  convInner.appendChild(el);
+  stickToBottom = true;
+  scrollDown();
+  scheduleSave();
+}
+
 function setStatus(mode) {
   statusDot.className = "dot " + mode;
   progressEl.hidden = mode !== "busy";
@@ -2219,7 +2370,10 @@ function saveState() {
   saveTimer = null;
   try {
     if (conversation.querySelectorAll(".bubble, .tool-block").length) {
-      localStorage.setItem("tju.gui.conv", convInner.innerHTML);
+      var clone = convInner.cloneNode(true);
+      var notices = clone.querySelectorAll(".sys-notice");
+      for (var nix = 0; nix < notices.length; nix++) notices[nix].remove();
+      localStorage.setItem("tju.gui.conv", clone.innerHTML);
     } else {
       localStorage.removeItem("tju.gui.conv");
     }
@@ -2517,6 +2671,9 @@ function handleLiveEvent(e) {
       clearSteerChips();
       loadRuns();
       break;
+    case "notice":
+      addNotice(e.message, e.level);
+      break;
     case "message_start": {
       var emptyEl = conversation.querySelector(".empty-card");
       if (emptyEl) emptyEl.remove();
@@ -2774,11 +2931,13 @@ optEnterSend.addEventListener("change", function () {
 });
 applySendMode();
 
-// ---- settings tabs (通用 / 更新) + self update ----
+// ---- settings tabs (通用 / 接口 / 更新) + self update ----
 var settingsTabGeneral = document.getElementById("settings-tab-general");
 var settingsTabUpdate = document.getElementById("settings-tab-update");
+var settingsTabProviders = document.getElementById("settings-tab-providers");
 var settingsPaneGeneral = document.getElementById("settings-pane-general");
 var settingsPaneUpdate = document.getElementById("settings-pane-update");
+var settingsPaneProviders = document.getElementById("settings-pane-providers");
 var updateVer = document.getElementById("update-ver");
 var updateStatus = document.getElementById("update-status");
 var btnUpdateCheck = document.getElementById("btn-update-check");
@@ -2787,17 +2946,36 @@ var btnUpdateRollback = document.getElementById("btn-update-rollback");
 var btnUpdateRestart = document.getElementById("btn-update-restart");
 var btnUpdateReload = document.getElementById("btn-update-reload");
 var updateApiHeaders = { "x-agent-token": AGENT_TOKEN };
+var dataRootPath = document.getElementById("data-root-path");
+var dataRootMode = document.getElementById("data-root-mode");
+var providerHelpDataDir = document.getElementById("provider-help-data-dir");
+function loadDataRoot() {
+  fetch("/api/version", { headers: updateApiHeaders })
+    .then(function (r) { return r.json(); })
+    .then(function (d) {
+      if (!d || !d.dataRoot) return;
+      if (dataRootPath) dataRootPath.textContent = d.dataRoot;
+      if (dataRootMode) {
+        dataRootMode.textContent = d.dataRootSource === "portable" ? "便携" : d.dataRootSource === "env" ? "自定义" : "本机";
+      }
+      if (providerHelpDataDir) providerHelpDataDir.textContent = d.dataRoot;
+    })
+    .catch(function () { if (dataRootPath) dataRootPath.textContent = "读取失败"; });
+}
 function setUpdateStatus(t) { if (updateStatus) updateStatus.textContent = t; }
 function switchSettingsTab(name) {
-  var general = name !== "update";
-  settingsTabGeneral.classList.toggle("active", general);
-  settingsTabUpdate.classList.toggle("active", !general);
-  settingsPaneGeneral.hidden = !general;
-  settingsPaneUpdate.hidden = general;
-  if (!general) loadUpdateVersion();
+  settingsTabGeneral.classList.toggle("active", name === "general");
+  settingsTabUpdate.classList.toggle("active", name === "update");
+  settingsTabProviders.classList.toggle("active", name === "providers");
+  settingsPaneGeneral.hidden = name !== "general";
+  settingsPaneUpdate.hidden = name !== "update";
+  settingsPaneProviders.hidden = name !== "providers";
+  if (name === "update") loadUpdateVersion();
+  if (name === "providers") loadProviders();
 }
 settingsTabGeneral.addEventListener("click", function () { switchSettingsTab("general"); });
 settingsTabUpdate.addEventListener("click", function () { switchSettingsTab("update"); });
+settingsTabProviders.addEventListener("click", function () { switchSettingsTab("providers"); });
 function loadUpdateVersion() {
   btnUpdateCheck.hidden = false;
   btnUpdateCheck.disabled = false;
@@ -2941,6 +3119,416 @@ btnUpdateRollback.addEventListener("click", function () {
 });
 btnUpdateReload.addEventListener("click", function () { location.reload(); });
 applySendMode();
+
+// ---- provider interfaces (设置 → 接口) ----
+var providerListEl = document.getElementById("provider-list");
+var providerFormEl = document.getElementById("provider-form");
+var providerHelpEl = document.getElementById("provider-help");
+var providerFormTitle = document.getElementById("provider-form-title");
+var providerFormStatus = document.getElementById("provider-form-status");
+var providerFId = document.getElementById("provider-f-id");
+var providerFLabel = document.getElementById("provider-f-label");
+var providerFBaseUrl = document.getElementById("provider-f-baseUrl");
+var providerFModel = document.getElementById("provider-f-model");
+var providerFKeyEnv = document.getElementById("provider-f-keyEnv");
+var providerFKey = document.getElementById("provider-f-key");
+var providerFTest = document.getElementById("provider-f-test");
+var providerFSave = document.getElementById("provider-f-save");
+var providerFCancel = document.getElementById("provider-f-cancel");
+var btnProviderAdd = document.getElementById("btn-provider-add");
+var providerCurrentEl = document.getElementById("provider-current");
+var providerCurrentDetail = document.getElementById("provider-current-detail");
+var providerSelect = document.getElementById("provider-select");
+var providerApiBtns = document.querySelectorAll(".provider-api-btn");
+var providerState = { entries: [], current: { entryId: null, modelId: "" }, warnings: [] };
+var providerEditing = null;
+var providerFormApi = "openai-completions";
+var providerHintShown = false;
+
+function providerApiLabel(api) { return api === "anthropic-messages" ? "Anthropic" : "OpenAI 兼容"; }
+
+function providerEntryById(id) {
+  for (var i = 0; i < providerState.entries.length; i++) {
+    if (providerState.entries[i].id === id) return providerState.entries[i];
+  }
+  return null;
+}
+
+function providerHasAnyKey() {
+  for (var i = 0; i < providerState.entries.length; i++) {
+    if (providerState.entries[i].hasKey) return true;
+  }
+  return false;
+}
+
+function setProviderFormStatus(text, kind) {
+  providerFormStatus.textContent = text || "";
+  providerFormStatus.classList.toggle("err", kind === "err");
+  providerFormStatus.classList.toggle("ok", kind === "ok");
+}
+
+function renderProviderApiButtons() {
+  for (var i = 0; i < providerApiBtns.length; i++) {
+    providerApiBtns[i].classList.toggle("active", providerApiBtns[i].dataset.api === providerFormApi);
+  }
+}
+
+function providerActionBtn(text, kind, onClick) {
+  var btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "modal-btn" + (kind ? " " + kind : "");
+  btn.textContent = text;
+  btn.addEventListener("click", onClick);
+  return btn;
+}
+
+function buildProviderItem(item) {
+  var row = document.createElement("div");
+  row.className = "provider-item" + (item.id === providerState.current.entryId ? " current" : "");
+  var body = document.createElement("div");
+  body.className = "provider-item-body";
+  var title = document.createElement("div");
+  title.className = "provider-item-title";
+  var name = document.createElement("span");
+  name.textContent = item.label || item.id;
+  title.appendChild(name);
+  var idEl = document.createElement("span");
+  idEl.className = "provider-item-id";
+  idEl.textContent = item.id;
+  title.appendChild(idEl);
+  var srcTag = document.createElement("span");
+  srcTag.className = "provider-tag";
+  srcTag.textContent = item.source === "user" ? "自定义" : "内置";
+  title.appendChild(srcTag);
+  var keyTag = document.createElement("span");
+  keyTag.className = "provider-tag " + (item.hasKey ? "ok" : "warn");
+  keyTag.textContent = item.hasKey ? "key 已配置" : "未配置 key";
+  title.appendChild(keyTag);
+  body.appendChild(title);
+  var meta = document.createElement("div");
+  meta.className = "provider-item-meta";
+  meta.textContent = providerApiLabel(item.api) + " · " + (item.baseUrl || "-") + " · 默认模型 " + (item.defaultModel || "-");
+  body.appendChild(meta);
+  row.appendChild(body);
+  var acts = document.createElement("div");
+  acts.className = "provider-item-actions";
+  if (item.id !== providerState.current.entryId) {
+    acts.appendChild(providerActionBtn("使用", "primary", function () { useProvider(item.id); }));
+  }
+  acts.appendChild(providerActionBtn("编辑", "", function () { openProviderForm(item); }));
+  if (item.source === "user") {
+    acts.appendChild(providerActionBtn("删除", "danger", function () { confirmDeleteProvider(item); }));
+  }
+  row.appendChild(acts);
+  return row;
+}
+
+function renderProviderCurrent() {
+  var found = providerEntryById(providerState.current.entryId);
+  if (!found) {
+    providerCurrentEl.textContent = providerState.current.entryId || "未选择";
+    providerCurrentDetail.textContent = "未选择可用的接口，请到“接口”页添加";
+    return;
+  }
+  providerCurrentEl.textContent = found.label || found.id;
+  providerCurrentDetail.textContent = providerApiLabel(found.api) + " · " + (found.baseUrl || "-") + " · "
+    + (providerState.current.modelId || found.defaultModel)
+    + (found.hasKey ? "" : "（未配置 key，无法调用）");
+}
+
+function renderProviderSelect() {
+  providerSelect.replaceChildren();
+  if (!providerState.current.entryId) {
+    var placeholder = document.createElement("option");
+    placeholder.value = "";
+    placeholder.textContent = "选择接口…";
+    providerSelect.appendChild(placeholder);
+  }
+  for (var i = 0; i < providerState.entries.length; i++) {
+    var item = providerState.entries[i];
+    var opt = document.createElement("option");
+    opt.value = item.id;
+    var optModel = (item.id === providerState.current.entryId && providerState.current.modelId)
+      ? providerState.current.modelId
+      : (item.defaultModel || "");
+    var optLabel = item.label || item.id;
+    if (optModel && optLabel.indexOf(optModel) === -1) optLabel += " · " + optModel;
+    if (!item.hasKey) optLabel += "（无 key）";
+    opt.textContent = optLabel;
+    providerSelect.appendChild(opt);
+  }
+  providerSelect.value = providerState.current.entryId || "";
+  providerSelect.title = "切换接口：模型会切到该接口的默认模型";
+}
+
+function renderProviders() {
+  providerListEl.replaceChildren();
+  var warnings = providerState.warnings || [];
+  for (var w = 0; w < warnings.length; w++) {
+    var line = document.createElement("div");
+    line.className = "provider-warn";
+    line.textContent = warnings[w];
+    providerListEl.appendChild(line);
+  }
+  if (!providerState.entries.length) {
+    var empty = document.createElement("div");
+    empty.className = "provider-empty";
+    empty.textContent = "暂无可用接口";
+    providerListEl.appendChild(empty);
+  }
+  for (var i = 0; i < providerState.entries.length; i++) {
+    providerListEl.appendChild(buildProviderItem(providerState.entries[i]));
+  }
+  renderProviderCurrent();
+  renderProviderSelect();
+}
+
+function loadProviders(done) {
+  fetch("/api/providers", { headers: { "x-agent-token": AGENT_TOKEN } })
+    .then(function (r) { return r.json(); })
+    .then(function (data) {
+      if (!data || !data.entries) return;
+      providerState = data;
+      renderProviders();
+      if (typeof done === "function") done();
+      if (!providerHintShown && !providerHasAnyKey()) {
+        providerHintShown = true;
+        addNotice("尚未配置可用的模型接口：请到 设置 → 接口 添加接口并填写 key，然后再发送消息。", "warn");
+        openSettings();
+        switchSettingsTab("providers");
+      }
+    })
+    .catch(function () {});
+}
+
+function useProvider(id, note) {
+  fetch("/api/provider", {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-agent-token": AGENT_TOKEN },
+    body: JSON.stringify({ entryId: id })
+  })
+    .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, body: d }; }); })
+    .then(function (x) {
+      if (!x.ok) {
+        addNotice("切换接口失败：" + ((x.body && x.body.error) || "未知错误"), "warn");
+        return;
+      }
+      var entry = providerEntryById(id);
+      addNotice(note || ("已切换到接口：" + ((entry && entry.label) || id)), "info");
+      loadProviders();
+    })
+    .catch(function (err) {
+      addNotice("切换接口失败：" + String((err && err.message) || err), "warn");
+    });
+}
+
+function openProviderForm(entry) {
+  providerEditing = entry || null;
+  providerFormApi = providerEditing ? providerEditing.api : "openai-completions";
+  providerFormTitle.textContent = providerEditing ? "编辑接口：" + (providerEditing.label || providerEditing.id) : "新增接口";
+  providerFId.value = providerEditing ? providerEditing.id : "";
+  providerFId.disabled = !!providerEditing;
+  providerFLabel.value = providerEditing ? providerEditing.label || "" : "";
+  providerFBaseUrl.value = providerEditing ? providerEditing.baseUrl || "" : "";
+  providerFModel.value = providerEditing ? providerEditing.defaultModel || "" : "";
+  providerFKeyEnv.value = providerEditing && providerEditing.keyEnv ? providerEditing.keyEnv : "";
+  providerFKey.value = "";
+  providerFKey.placeholder = providerEditing && providerEditing.hasKey
+    ? "API key（留空则不改动已保存的 key）"
+    : "API key（只写不显；留空则用环境变量）";
+  setProviderFormStatus("");
+  renderProviderApiButtons();
+  providerListEl.hidden = true;
+  providerHelpEl.hidden = true;
+  btnProviderAdd.hidden = true;
+  providerFormEl.hidden = false;
+  var modal = providerFormEl.closest(".modal");
+  if (modal) modal.scrollTop = 0;
+  providerFId.focus();
+}
+
+function closeProviderForm() {
+  providerFormEl.hidden = true;
+  providerListEl.hidden = false;
+  providerHelpEl.hidden = false;
+  btnProviderAdd.hidden = false;
+  providerEditing = null;
+  setProviderFormStatus("");
+}
+
+function testProviderConnection() {
+  var baseUrl = providerFBaseUrl.value.trim();
+  if (!baseUrl) {
+    setProviderFormStatus("请先填写接口地址", "err");
+    providerFBaseUrl.focus();
+    return;
+  }
+  var keyEnv = providerFKeyEnv.value.trim();
+  var entry = { id: providerFId.value.trim() || "test", api: providerFormApi, baseUrl: baseUrl };
+  if (keyEnv) entry.keyEnv = keyEnv;
+  providerFTest.disabled = true;
+  setProviderFormStatus("正在测试连接…");
+  fetch("/api/providers/test", {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-agent-token": AGENT_TOKEN },
+    body: JSON.stringify({ entry: entry, key: providerFKey.value })
+  })
+    .then(function (r) { return r.json(); })
+    .then(function (d) {
+      providerFTest.disabled = false;
+      if (!d) { setProviderFormStatus("测试失败：无响应", "err"); return; }
+      if (d.error) { setProviderFormStatus("测试失败：" + d.error, "err"); return; }
+      var models = d.models || [];
+      if (!models.length) { setProviderFormStatus("连接成功，但 /models 未返回可用模型", "err"); return; }
+      if (!providerFModel.value.trim()) providerFModel.value = models[0];
+      setProviderFormStatus("连接成功，可用模型 " + models.length + " 个（如 " + models.slice(0, 3).join("、") + "）", "ok");
+    })
+    .catch(function (err) {
+      providerFTest.disabled = false;
+      setProviderFormStatus("测试失败：" + String((err && err.message) || err), "err");
+    });
+}
+
+function afterProviderChange(id, model) {
+  if (providerState.current.entryId === id) {
+    fetch("/api/provider", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-agent-token": AGENT_TOKEN },
+      body: JSON.stringify({ entryId: id, model: model })
+    })
+      .then(function () { loadProviders(); })
+      .catch(function () { loadProviders(); });
+    return;
+  }
+  loadProviders();
+}
+
+function saveProvider() {
+  var id = providerFId.value.trim();
+  var baseUrl = providerFBaseUrl.value.trim();
+  var model = providerFModel.value.trim();
+  if (!id) { setProviderFormStatus("请填写接口 id", "err"); providerFId.focus(); return; }
+  if (!/^[A-Za-z0-9._-]+$/.test(id)) {
+    setProviderFormStatus("id 只能用英文字母、数字、点、下划线或横线", "err");
+    providerFId.focus();
+    return;
+  }
+  if (!baseUrl) { setProviderFormStatus("请填写接口地址", "err"); providerFBaseUrl.focus(); return; }
+  if (!model) { setProviderFormStatus("请填写默认模型 ID", "err"); providerFModel.focus(); return; }
+  var entry = {
+    id: id,
+    label: providerFLabel.value.trim() || id,
+    api: providerFormApi,
+    provider: (providerEditing && providerEditing.provider) || (providerFormApi === "anthropic-messages" ? "anthropic" : "openai"),
+    baseUrl: baseUrl,
+    defaultModel: model
+  };
+  var keyEnv = providerFKeyEnv.value.trim();
+  if (keyEnv) entry.keyEnv = keyEnv;
+  if (providerEditing && providerEditing.source === "user" && providerEditing.models) entry.models = providerEditing.models;
+  providerFSave.disabled = true;
+  fetch("/api/providers", {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-agent-token": AGENT_TOKEN },
+    body: JSON.stringify({ entry: entry })
+  })
+    .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, body: d }; }); })
+    .then(function (x) {
+      if (!x.ok) {
+        providerFSave.disabled = false;
+        setProviderFormStatus((x.body && x.body.error) || "保存失败", "err");
+        return;
+      }
+      var key = providerFKey.value;
+      if (!key) {
+        providerFSave.disabled = false;
+        closeProviderForm();
+        addNotice("接口已保存：" + id, "info");
+        afterProviderChange(id, model);
+        return;
+      }
+      return fetch("/api/providers/key", {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-agent-token": AGENT_TOKEN },
+        body: JSON.stringify({ entryId: id, key: key })
+      })
+        .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, body: d }; }); })
+        .then(function (y) {
+          providerFSave.disabled = false;
+          if (!y.ok) {
+            setProviderFormStatus((y.body && y.body.error) || "key 保存失败", "err");
+            return;
+          }
+          closeProviderForm();
+          addNotice("接口已保存：" + id, "info");
+          afterProviderChange(id, model);
+        });
+    })
+    .catch(function (err) {
+      providerFSave.disabled = false;
+      setProviderFormStatus("保存失败：" + String((err && err.message) || err), "err");
+    });
+}
+
+function pickFallbackProvider(deletedId) {
+  for (var i = 0; i < providerState.entries.length; i++) {
+    var item = providerState.entries[i];
+    if (item.id !== deletedId && item.hasKey) {
+      useProvider(item.id, "当前接口已删除，已切换到：" + (item.label || item.id));
+      return;
+    }
+  }
+  addNotice("当前接口已删除，且没有其它可用接口，请到 设置 → 接口 添加。", "warn");
+}
+
+function confirmDeleteProvider(item) {
+  showModal({
+    title: "删除接口配置",
+    text: "确定删除「" + (item.label || item.id) + "」吗？会从 providers.json 移除该条目，不可恢复（内置接口不受影响）。",
+    okText: "删除",
+    danger: true,
+    showCancel: true,
+    onOk: function () {
+      var wasCurrent = providerState.current.entryId === item.id;
+      fetch("/api/providers/" + encodeURIComponent(item.id), {
+        method: "DELETE",
+        headers: { "x-agent-token": AGENT_TOKEN }
+      })
+        .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, body: d }; }); })
+        .then(function (x) {
+          if (!x.ok) {
+            addNotice("删除失败：" + ((x.body && x.body.error) || "未知错误"), "warn");
+            return;
+          }
+          addNotice("已删除接口：" + item.id, "info");
+          loadProviders(function () { if (wasCurrent) pickFallbackProvider(item.id); });
+        })
+        .catch(function (err) { addNotice("删除失败：" + String((err && err.message) || err), "warn"); });
+    }
+  });
+}
+
+for (var providerApiIndex = 0; providerApiIndex < providerApiBtns.length; providerApiIndex++) {
+  providerApiBtns[providerApiIndex].addEventListener("click", function () {
+    providerFormApi = this.dataset.api;
+    renderProviderApiButtons();
+  });
+}
+btnProviderAdd.addEventListener("click", function () { openProviderForm(null); });
+providerFCancel.addEventListener("click", closeProviderForm);
+providerFTest.addEventListener("click", testProviderConnection);
+providerFSave.addEventListener("click", saveProvider);
+providerFormEl.addEventListener("keydown", function (ev) {
+  if (ev.key === "Enter" && ev.target && ev.target.tagName === "INPUT") {
+    ev.preventDefault();
+    saveProvider();
+  }
+});
+providerSelect.addEventListener("change", function () {
+  var id = providerSelect.value;
+  if (!id || id === providerState.current.entryId) { renderProviderSelect(); return; }
+  useProvider(id);
+});
 
 var MAX_ATTACH = 20;
 var MAX_ATTACH_BYTES = 30 * 1024 * 1024;
@@ -3778,14 +4366,28 @@ var es = new EventSource("/api/events?token=" + encodeURIComponent(AGENT_TOKEN))
 var approvalBox = document.getElementById("approval");
 var approvalText = document.getElementById("approval-text");
 var approvalRequestId = null;
+var approvalQueue = [];
+
+function showNextApproval() {
+  if (approvalRequestId || !approvalQueue.length) return;
+  var req = approvalQueue.shift();
+  approvalRequestId = req.requestId;
+  approvalText.textContent = "工具 " + req.toolName + " 将访问工作目录外的目录：\\n  " + req.scopeDir + "\\n『总是允许』将在本次会话内记住该目录。";
+  approvalBox.hidden = false;
+}
 
 function answerApproval(mode) {
   if (!approvalRequestId) return;
+  var id = approvalRequestId;
+  approvalRequestId = null;
+  approvalBox.hidden = true;
   fetch("/api/approve", {
     method: "POST",
     headers: { "content-type": "application/json", "x-agent-token": AGENT_TOKEN },
-    body: JSON.stringify({ requestId: approvalRequestId, mode: mode })
-  }).then(function () { approvalBox.hidden = true; });
+    body: JSON.stringify({ requestId: id, mode: mode })
+  }).then(function () { showNextApproval(); })
+    .catch(function () { showNextApproval(); });
+  showNextApproval();
 }
 document.getElementById("approval-once").addEventListener("click", function () { answerApproval("once"); });
 document.getElementById("approval-always").addEventListener("click", function () { answerApproval("always"); });
@@ -3837,11 +4439,15 @@ function handleServerMessage(msg) {
   }
   else if (msg.kind === "approval") {
     if (msg.request) {
-      approvalRequestId = msg.request.requestId;
-      approvalText.textContent = "工具 " + msg.request.toolName + " 将访问工作目录外的目录：\\n  " + msg.request.scopeDir + "\\n『总是允许』将在本次会话内记住该目录。";
-      approvalBox.hidden = false;
+      var dup = false;
+      for (var ai = 0; ai < approvalQueue.length; ai++) {
+        if (approvalQueue[ai].requestId === msg.request.requestId) { dup = true; break; }
+      }
+      if (!dup && approvalRequestId !== msg.request.requestId) approvalQueue.push(msg.request);
+      showNextApproval();
     } else {
       approvalRequestId = null;
+      approvalQueue = [];
       approvalBox.hidden = true;
     }
   }
@@ -3849,4 +4455,5 @@ function handleServerMessage(msg) {
   else if (msg.kind === "works") { loadWorks(); }
 }
 es.onerror = function () { setStatus("err"); };
-restoreState();`;
+restoreState();
+loadProviders();`;

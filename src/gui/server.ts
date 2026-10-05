@@ -1,10 +1,22 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { randomBytes } from "node:crypto";
 import { readFile, readdir, stat } from "node:fs/promises";
-import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createAgent } from "../create-agent.ts";
+import { PROVIDER_ENTRIES } from "../config.ts";
+import { describeDataRoot, resolveDataRoot } from "../data-root.ts";
+import {
+	deleteUserEntry,
+	loadProviderTable,
+	probeModels,
+	readSecrets,
+	resolveEntryKey,
+	resolveInterface,
+	upsertUserEntry,
+	writeSecret,
+	type UserProviderEntry,
+} from "../providers.ts";
 import { cleanupRuns, EventLog, isSafeRunId, listRuns, readRunEvents, readRunEventsStream, removeRun, removeRuns, summarizeRuns } from "../core/event-log.ts";
 import { createApprovalGate } from "../core/permission.ts";
 import { SessionStore, type WorkItem } from "../core/session-store.ts";
@@ -49,13 +61,14 @@ export async function startGuiServer(config: RunConfig, flags: CliFlags): Promis
 	const pendingApprovals = new Map<string, (mode: boolean | "always") => void>();
 	const token = randomBytes(16).toString("hex");
 
-	const logDir = config.logDir ?? join(homedir(), ".tju-code", "logs");
+	const dataRoot = resolveDataRoot();
+	const logDir = config.logDir ?? join(dataRoot, "logs");
 	const logRetentionDays = config.logRetentionDays ?? 7;
 	await cleanupRuns(logDir, logRetentionDays);
 
-	const sessionDir = config.sessionDir ?? join(homedir(), ".tju-code", "works");
+	const sessionDir = config.sessionDir ?? join(dataRoot, "works");
 	const sessionStore = new SessionStore({ dir: sessionDir });
-	const attachmentStore = new AttachmentStore(join(homedir(), ".tju-code", "attachments"));
+	const attachmentStore = new AttachmentStore(join(dataRoot, "attachments"));
 	const workTodos: TodoStore = { todos: [] };
 	let currentWorkId: string | null = null;
 	let currentRunId: string | null = null;
@@ -77,6 +90,7 @@ export async function startGuiServer(config: RunConfig, flags: CliFlags): Promis
 			title: existing?.title ?? "未命名工作项",
 			cwd,
 			model: agent.state.model,
+			providerEntryId: agent.provider.entryId,
 			messages: agent.state.messages,
 			todos: workTodos.todos,
 			createdAt: existing?.createdAt ?? Date.now(),
@@ -104,19 +118,34 @@ export async function startGuiServer(config: RunConfig, flags: CliFlags): Promis
 		await saveCurrentWork(bump);
 	};
 
-	const openWork = async (id: string): Promise<void> => {
+	const restoreProvider = (entryId: string | undefined, modelId: string | undefined): boolean => {
+		if (!entryId) return false;
+		const loaded = loadProviderTable(PROVIDER_ENTRIES);
+		const resolved = resolveInterface(loaded.table, entryId, modelId, process.env, readSecrets());
+		if ("error" in resolved) return true;
+		agent.setProvider({
+			model: { ...agent.state.model, ...resolved.model },
+			apiKey: resolved.apiKey,
+			entryId: resolved.entryId,
+		});
+		return false;
+	};
+
+	const openWork = async (id: string): Promise<{ providerFallback: boolean }> => {
 		const item = await sessionStore.load(id);
-		if (!item) return;
+		if (!item) return { providerFallback: false };
 		if (currentWorkId) await saveCurrentWork(false);
 		await agent.waitForIdle();
 		workTodos.todos = item.todos.slice();
 		agent.restore({ messages: item.messages, todos: item.todos });
+		const fellBack = restoreProvider(item.providerEntryId, item.model?.id);
 		agent.setModel({ ...agent.state.model, reasoningEffort: workEffort(item) });
 		currentWorkId = id;
 		await sessionStore.setLastActive(id);
 		// Re-sync the browser's model/effort display with the reopened work item.
 		broadcast({ kind: "state", state: agent.state, work: null });
 		broadcast({ kind: "works" });
+		return { providerFallback: fellBack };
 	};
 
 	// A request is trusted when it comes from the browser page we served
@@ -254,6 +283,14 @@ export async function startGuiServer(config: RunConfig, flags: CliFlags): Promis
 		if (item) {
 			workTodos.todos = item.todos.slice();
 			agent.restore({ messages: item.messages, todos: item.todos });
+			// An explicit --profile (including the launcher auto-select) expresses
+			// which interface to use right now and wins over the stored work item;
+			// otherwise the previous session's interface would silently override
+			// every freshly double-clicked launcher script.
+			const explicitProfile = typeof flags.profile === "string" && flags.profile;
+			if (!explicitProfile && restoreProvider(item.providerEntryId, item.model?.id)) {
+				console.error(`[warn] work item "${item.title}" 的接口已不存在，已切到默认接口`);
+			}
 			agent.setModel({ ...agent.state.model, reasoningEffort: workEffort(item) });
 			currentWorkId = item.id;
 		} else {
@@ -571,6 +608,124 @@ export async function startGuiServer(config: RunConfig, flags: CliFlags): Promis
 				return;
 			}
 
+			if (pathname === "/api/providers" && req.method === "GET") {
+				const loaded = loadProviderTable(PROVIDER_ENTRIES);
+				const secrets = readSecrets();
+				writeJson(res, 200, {
+					entries: Object.values(loaded.table).map((e) => ({
+						id: e.id,
+						label: e.label,
+						api: e.api,
+						provider: e.provider,
+						baseUrl: e.baseUrl,
+						defaultModel: e.defaultModel,
+						models: e.models,
+						source: e.source ?? "builtin",
+						keyEnv: e.keyEnv,
+						hasKey: !!resolveEntryKey(e, process.env, secrets),
+					})),
+					current: { entryId: agent.provider.entryId ?? null, modelId: agent.state.model.id },
+					warnings: loaded.warnings,
+				});
+				return;
+			}
+
+			if (pathname === "/api/provider" && req.method === "POST") {
+				const body = await readBody(req);
+				const entryId = typeof body.entryId === "string" ? body.entryId : "";
+				const modelId = typeof body.model === "string" ? body.model : undefined;
+				if (!entryId) {
+					writeJson(res, 400, { error: "需要 entryId" });
+					return;
+				}
+				const loaded = loadProviderTable(PROVIDER_ENTRIES);
+				const resolved = resolveInterface(loaded.table, entryId, modelId, process.env, readSecrets());
+				if ("error" in resolved) {
+					writeJson(res, 400, { error: resolved.error });
+					return;
+				}
+				agent.setProvider({
+					model: { ...agent.state.model, ...resolved.model },
+					apiKey: resolved.apiKey,
+					entryId: resolved.entryId,
+				});
+				await saveCurrentWork(false);
+				broadcast({ kind: "state", state: agent.state, work: null });
+				writeJson(res, 200, { ok: true, entryId: resolved.entryId, model: agent.state.model.id });
+				return;
+			}
+
+			if (pathname === "/api/providers" && req.method === "POST") {
+				const body = await readBody(req);
+				const result = upsertUserEntry(PROVIDER_ENTRIES, body.entry as UserProviderEntry);
+				if ("error" in result) {
+					writeJson(res, 400, { error: result.error });
+					return;
+				}
+				writeJson(res, 200, { ok: true });
+				return;
+			}
+
+			const providerDeleteMatch = pathname.match(/^\/api\/providers\/([^/]+)$/);
+			if (providerDeleteMatch && providerDeleteMatch[1] && req.method === "DELETE") {
+				const result = deleteUserEntry(decodeURIComponent(providerDeleteMatch[1]));
+				if ("error" in result) {
+					writeJson(res, 400, { error: result.error });
+					return;
+				}
+				writeJson(res, 200, { ok: true });
+				return;
+			}
+
+			if (pathname === "/api/providers/test" && req.method === "POST") {
+				const body = await readBody(req);
+				const raw = (body.entry ?? null) as UserProviderEntry | null;
+				if (!raw || typeof raw !== "object") {
+					writeJson(res, 400, { error: "需要 entry 对象才能测试" });
+					return;
+				}
+				const api = raw && (raw.api === "openai-completions" || raw.api === "anthropic-messages") ? raw.api : undefined;
+				const baseUrl = raw && typeof raw.baseUrl === "string" ? raw.baseUrl : "";
+				if (!api || !baseUrl) {
+					writeJson(res, 400, { error: "需要合法的 api 与 baseUrl 才能测试" });
+					return;
+				}
+				const key =
+					typeof body.key === "string" && body.key
+						? body.key
+						: resolveEntryKey(
+								{
+									id: typeof raw.id === "string" ? raw.id : "",
+									label: "",
+									api,
+									provider: "",
+									baseUrl,
+									defaultModel: "",
+									keyEnv: typeof raw.keyEnv === "string" ? raw.keyEnv : undefined,
+								},
+								process.env,
+								readSecrets(),
+							);
+				writeJson(res, 200, await probeModels({ api, baseUrl }, key));
+				return;
+			}
+
+			if (pathname === "/api/providers/key" && req.method === "POST") {
+				const body = await readBody(req);
+				const entryId = typeof body.entryId === "string" ? body.entryId : "";
+				if (!entryId) {
+					writeJson(res, 400, { error: "需要 entryId" });
+					return;
+				}
+				try {
+					writeSecret(entryId, typeof body.key === "string" && body.key ? body.key : null);
+				} catch (err) {
+					writeJson(res, 500, { error: `写入失败：${err instanceof Error ? err.message : String(err)}` });
+					return;
+				}
+				writeJson(res, 200, { ok: true });
+				return;
+			}
 			if (pathname === "/api/version" && req.method === "GET") {
 				let root: string | null = null;
 				try {
@@ -751,8 +906,8 @@ export async function startGuiServer(config: RunConfig, flags: CliFlags): Promis
 					writeJson(res, 404, { error: "Work item not found" });
 					return;
 				}
-				await openWork(id);
-				writeJson(res, 200, { ok: true, work: item });
+				const opened = await openWork(id);
+				writeJson(res, 200, { ok: true, work: item, providerFallback: opened.providerFallback });
 				return;
 			}
 

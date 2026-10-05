@@ -167,6 +167,20 @@ function sleep(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function desensitizeArgs(args: string[]): string[] {
+	const out = args.slice();
+	for (let i = 0; i < out.length; i++) {
+		const arg = out[i];
+		if (arg === undefined) continue;
+		const eq = arg.indexOf("=");
+		const name = eq === -1 ? arg : arg.slice(0, eq);
+		if (name !== "--api-key") continue;
+		if (eq !== -1) out[i] = `${name}=***`;
+		else if (i + 1 < out.length) out[i + 1] = "***";
+	}
+	return out;
+}
+
 async function renameRetry(from: string, to: string, attempts = 5): Promise<void> {
 	let last: unknown = null;
 	for (let i = 0; i < attempts; i++) {
@@ -258,7 +272,7 @@ export function relaunch(root: string, args: string[]): void {
 		logLine(`spawn failed: ${err instanceof Error ? err.message : String(err)}`);
 		throw err;
 	}
-	logLine(`spawned pid=${child.pid} ${target.join(" ")}`);
+	logLine(`spawned pid=${child.pid} ${desensitizeArgs(target).join(" ")}`);
 	child.on("error", (err) => {
 		logLine(`child error: ${err instanceof Error ? err.message : String(err)}`);
 	});

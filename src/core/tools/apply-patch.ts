@@ -1,7 +1,37 @@
 import { readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { z } from "zod";
 import type { AgentTool } from "../types.ts";
+import { tryReplace } from "./edit.ts";
 import { ensureParentDir, resolvePath } from "./read.ts";
+
+const opAliases: Record<string, "add" | "edit" | "delete"> = {
+	create: "add",
+	new: "add",
+	update: "edit",
+	modify: "edit",
+	replace: "edit",
+	remove: "delete",
+	del: "delete",
+};
+
+function normalizeOp(value: unknown): unknown {
+	if (!value || typeof value !== "object") return value;
+	const rec = value as Record<string, unknown>;
+	let op = typeof rec.op === "string" ? rec.op.toLowerCase() : "";
+	if (!op) {
+		if (typeof rec.oldString === "string" && typeof rec.newString === "string") op = "edit";
+		else if (typeof rec.content === "string") op = "add";
+		else if (typeof rec.path === "string") op = "delete";
+	} else {
+		const alias = opAliases[op];
+		if (alias) op = alias;
+	}
+	return { ...rec, op };
+}
+
+function normalizeOperations(value: unknown): unknown {
+	return Array.isArray(value) ? value.map(normalizeOp) : value;
+}
 
 const applyOpSchema = z.discriminatedUnion("op", [
 	z.object({
@@ -23,8 +53,7 @@ const applyOpSchema = z.discriminatedUnion("op", [
 
 export const applyPatchSchema = z.object({
 	operations: z
-		.array(applyOpSchema)
-		.min(1)
+		.preprocess(normalizeOperations, z.array(applyOpSchema).min(1))
 		.describe("The operations to apply sequentially; they may touch multiple files"),
 });
 
@@ -51,7 +80,7 @@ export function createApplyPatchTool(cwd: string): AgentTool<typeof applyPatchSc
 		name: "apply_patch",
 		label: "apply_patch",
 		description:
-			"Apply a sequence of add / edit / delete file operations across one or more files in a single tool call. Operations apply in order; if one fails, the earlier operations remain applied and the error lists what succeeded. Prefer this over repeated edit/write calls when changing multiple files at once.",
+			"Apply a sequence of add / edit / delete file operations across one or more files in a single tool call. Operations apply in order; if one fails, the earlier operations remain applied and the error lists what succeeded. Each operation needs op ('add' | 'edit' | 'delete'); op may be omitted when the shape is unambiguous ({path, oldString, newString} defaults to edit, {path, content} to add, {path} alone to delete). Prefer this over repeated edit/write calls when changing multiple files at once.",
 		parameters: applyPatchSchema,
 		promptSnippet: "apply multiple file changes in one call",
 		async execute(_call, { operations }) {
@@ -69,18 +98,18 @@ export function createApplyPatchTool(cwd: string): AgentTool<typeof applyPatchSc
 						const info = await stat(absolute).catch(() => null);
 						if (!info || !info.isFile()) throw new Error(`not a file: ${absolute}`);
 						const content = await readFile(absolute, "utf-8");
-						const occurrences = content.split(op.oldString).length - 1;
-						if (occurrences === 0) {
+						const attempt = tryReplace(content, op.oldString, op.newString, false);
+						if (attempt.updated === null) {
+							if (attempt.exactOccurrences > 1) {
+								throw new Error(
+									`old_string matched ${attempt.exactOccurrences} times in ${absolute}; provide more surrounding context or split the edit`,
+								);
+							}
 							throw new Error(
 								`could not find old_string in ${absolute} (0 matches); re-read the file first`,
 							);
 						}
-						if (occurrences > 1) {
-							throw new Error(
-								`old_string matched ${occurrences} times in ${absolute}; provide more surrounding context or split the edit`,
-							);
-						}
-						await atomicWrite(absolute, content.replace(op.oldString, op.newString));
+						await atomicWrite(absolute, attempt.updated);
 						applied.push(`edit ${absolute}`);
 					} else {
 						await rm(absolute, { force: true });

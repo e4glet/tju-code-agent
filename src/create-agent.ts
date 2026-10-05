@@ -39,25 +39,14 @@ export function createAgent(options: CreateAgentOptions): Agent {
 	const { config, cwd } = options;
 	const todoStore: TodoStore = options.todoStore ?? { todos: [] };
 	const tools = options.tools ?? createAllTools(cwd);
-	const model = modelFromConfig(config);
 	const afterToolCall = securityHintAfterToolCall(options.afterToolCall);
-	return new Agent({
-		model,
+	const agentModel = modelFromConfig(config);
+	const agent = new Agent({
+		model: agentModel,
 		systemPrompt: options.systemPrompt ?? DEFAULT_SYSTEM_PROMPT,
-		tools: [
-			...tools,
-			createTodoTool(todoStore) as unknown as AgentTool,
-			createSubAgentTool({
-				cwd,
-				model,
-				apiKey: config.apiKey,
-				maxTokens: config.maxTokens,
-				tools,
-				beforeToolCall: options.beforeToolCall,
-				afterToolCall,
-			}) as unknown as AgentTool,
-		],
+		tools: [...tools, createTodoTool(todoStore) as unknown as AgentTool],
 		apiKey: config.apiKey,
+		provider: { model: agentModel, apiKey: config.apiKey, entryId: config.providerEntryId },
 		maxTokens: config.maxTokens,
 		maxContextTokens: config.maxContextTokens,
 		maxTurns: config.maxTurns,
@@ -66,4 +55,16 @@ export function createAgent(options: CreateAgentOptions): Agent {
 		todoStore,
 		resolveAttachment: options.resolveAttachment,
 	});
+	agent.setTools([
+		...agent.state.tools,
+		createSubAgentTool({
+			cwd,
+			provider: agent.provider,
+			maxTokens: config.maxTokens,
+			tools,
+			beforeToolCall: options.beforeToolCall,
+			afterToolCall,
+		}) as unknown as AgentTool,
+	]);
+	return agent;
 }
