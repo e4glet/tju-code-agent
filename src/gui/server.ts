@@ -706,7 +706,8 @@ export async function startGuiServer(config: RunConfig, flags: CliFlags): Promis
 								process.env,
 								readSecrets(),
 							);
-				writeJson(res, 200, await probeModels({ api, baseUrl }, key));
+				const model = raw && typeof raw.defaultModel === "string" ? raw.defaultModel : undefined;
+				writeJson(res, 200, await probeModels({ api, baseUrl, model }, key));
 				return;
 			}
 

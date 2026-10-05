@@ -2916,7 +2916,11 @@ function openSettings() {
   settingsBackdrop.hidden = false;
   optEnterSend.focus();
 }
-function closeSettings() { settingsBackdrop.hidden = true; }
+function closeSettings() {
+  closeProviderForm();
+  switchSettingsTab("general");
+  settingsBackdrop.hidden = true;
+}
 settingsBtn.addEventListener("click", openSettings);
 settingsClose.addEventListener("click", closeSettings);
 settingsBackdrop.addEventListener("click", function (e) { if (e.target === settingsBackdrop) closeSettings(); });
@@ -3364,7 +3368,7 @@ function testProviderConnection() {
     return;
   }
   var keyEnv = providerFKeyEnv.value.trim();
-  var entry = { id: providerFId.value.trim() || "test", api: providerFormApi, baseUrl: baseUrl };
+  var entry = { id: providerFId.value.trim() || "test", api: providerFormApi, baseUrl: baseUrl, defaultModel: providerFModel.value.trim() };
   if (keyEnv) entry.keyEnv = keyEnv;
   providerFTest.disabled = true;
   setProviderFormStatus("正在测试连接…");
@@ -3378,6 +3382,10 @@ function testProviderConnection() {
       providerFTest.disabled = false;
       if (!d) { setProviderFormStatus("测试失败：无响应", "err"); return; }
       if (d.error) { setProviderFormStatus("测试失败：" + d.error, "err"); return; }
+      if (d.fallback) {
+        setProviderFormStatus("连接成功，" + (d.note || "该接口不支持 /models 列表，模型请手动填写"), "ok");
+        return;
+      }
       var models = d.models || [];
       if (!models.length) { setProviderFormStatus("连接成功，但 /models 未返回可用模型", "err"); return; }
       if (!providerFModel.value.trim()) providerFModel.value = models[0];

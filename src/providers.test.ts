@@ -1,4 +1,5 @@
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -10,11 +11,33 @@ import {
 	LAUNCHER_ENTRY_PREFIX,
 	launcherMarkerFile,
 	loadProviderTable,
+	probeModels,
 	providersFile,
 	readSecrets,
 	secretsFile,
 	upsertUserEntry,
 } from "./providers.ts";
+
+const probeServers: Server[] = [];
+
+function startFakeEndpoint({ modelsStatus, chatStatus }: { modelsStatus: number; chatStatus?: number }): Promise<{ server: Server; port: number }> {
+	const server = createServer((req, res) => {
+		if (req.url === "/v1/models" || req.url === "/apps/anthropic/models") {
+			res.writeHead(modelsStatus, { "content-type": "application/json" });
+			res.end(modelsStatus === 200 ? JSON.stringify({ data: [{ id: "chat-a" }, { id: "embed-x" }, { id: "chat-b" }] }) : "{}");
+			return;
+		}
+		res.writeHead(chatStatus ?? 200, { "content-type": "application/json" });
+		res.end("{}");
+	});
+	return new Promise((resolve) => {
+		server.listen(0, "127.0.0.1", () => {
+			const address = server.address();
+			const port = typeof address === "object" && address ? address.port : 0;
+			resolve({ server, port });
+		});
+	});
+}
 
 const homes: string[] = [];
 
@@ -29,6 +52,7 @@ afterEach(() => {
 		const home = homes.pop();
 		if (home) rmSync(home, { recursive: true, force: true });
 	}
+	for (const server of probeServers.splice(0)) server.close();
 });
 
 const LAUNCHER_FLAGS = {
@@ -259,5 +283,47 @@ describe("applyLauncherConfig", () => {
 		const loaded = loadProviderTable(PROVIDER_ENTRIES, home);
 		expect(loaded.table.broken).toBeUndefined();
 		expect(loaded.warnings.some((w) => w.includes("broken"))).toBe(true);
+	});
+});
+
+describe("probeModels", () => {
+	it("lists models from /models when the endpoint supports it", async () => {
+		const { server, port } = await startFakeEndpoint({ modelsStatus: 200 });
+		probeServers.push(server);
+		const result = await probeModels({ api: "openai-completions", baseUrl: `http://127.0.0.1:${port}/v1` }, "k");
+		expect(result.error).toBeUndefined();
+		expect(result.fallback).toBeUndefined();
+		expect(result.models).toEqual(["chat-a", "chat-b"]);
+	});
+
+	it("falls back to a minimal chat ping when /models is missing", async () => {
+		const { server, port } = await startFakeEndpoint({ modelsStatus: 404, chatStatus: 200 });
+		probeServers.push(server);
+		const result = await probeModels({ api: "anthropic-messages", baseUrl: `http://127.0.0.1:${port}/apps/anthropic`, model: "real-model" }, "k");
+		expect(result.error).toBeUndefined();
+		expect(result.fallback).toBe(true);
+		expect(result.note).toContain("/models");
+	});
+
+	it("reports a rejected key without pinging", async () => {
+		const { server, port } = await startFakeEndpoint({ modelsStatus: 401, chatStatus: 200 });
+		probeServers.push(server);
+		const result = await probeModels({ api: "openai-completions", baseUrl: `http://127.0.0.1:${port}/v1` }, "bad");
+		expect(result.error).toContain("key 被拒绝");
+		expect(result.fallback).toBeUndefined();
+	});
+
+	it("reports a wrong address when the chat endpoint is missing too", async () => {
+		const { server, port } = await startFakeEndpoint({ modelsStatus: 404, chatStatus: 404 });
+		probeServers.push(server);
+		const result = await probeModels({ api: "openai-completions", baseUrl: `http://127.0.0.1:${port}/v1`, model: "m" }, "k");
+		expect(result.error).toContain("地址");
+	});
+
+	it("asks for a model id when pinging without one", async () => {
+		const { server, port } = await startFakeEndpoint({ modelsStatus: 404, chatStatus: 200 });
+		probeServers.push(server);
+		const result = await probeModels({ api: "openai-completions", baseUrl: `http://127.0.0.1:${port}/v1` }, "k");
+		expect(result.error).toContain("默认模型");
 	});
 });

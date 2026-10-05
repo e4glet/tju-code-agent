@@ -612,10 +612,19 @@ export function resolveInterface(
 
 const NON_CHAT_MODEL = /embed|tts|whisper|rerank|image|dall|transcri|moderation|audio|vision|ocr/i;
 
+export interface ProbeResult {
+	models?: string[];
+	error?: string;
+	/** True when connectivity was proven by a minimal chat ping because the
+	 * endpoint does not implement /models (common on gateways/transits). */
+	fallback?: boolean;
+	note?: string;
+}
+
 export async function probeModels(
-	entry: { api: ApiKind; baseUrl: string },
+	entry: { api: ApiKind; baseUrl: string; model?: string },
 	apiKey: string | undefined,
-): Promise<{ models?: string[]; error?: string }> {
+): Promise<ProbeResult> {
 	if (!apiKey) return { error: "缺少 API key，无法测试连接" };
 	const base = entry.baseUrl.replace(/\/+$/, "");
 	const headers: Record<string, string> =
@@ -626,17 +635,64 @@ export async function probeModels(
 	const timer = setTimeout(() => ctl.abort(), 15000);
 	try {
 		const res = await fetch(`${base}/models`, { headers, signal: ctl.signal });
-		if (!res.ok) {
-			const text = await res.text().catch(() => "");
-			return { error: `HTTP ${res.status}：${text.slice(0, 200)}` };
+		if (res.ok) {
+			const data = (await res.json().catch(() => null)) as { data?: Array<{ id?: unknown }> } | null;
+			const ids = Array.isArray(data?.data)
+				? (data?.data ?? [])
+						.map((m) => (typeof m?.id === "string" ? m.id : ""))
+						.filter((id) => id && !NON_CHAT_MODEL.test(id))
+				: [];
+			return { models: ids };
 		}
-		const data = (await res.json().catch(() => null)) as { data?: Array<{ id?: unknown }> } | null;
-		const ids = Array.isArray(data?.data)
-			? (data?.data ?? [])
-					.map((m) => (typeof m?.id === "string" ? m.id : ""))
-					.filter((id) => id && !NON_CHAT_MODEL.test(id))
-			: [];
-		return { models: ids };
+		if (res.status === 401 || res.status === 403) {
+			const text = await res.text().catch(() => "");
+			return { error: `连接已通，但 key 被拒绝（HTTP ${res.status}）：${text.slice(0, 200)}` };
+		}
+		const model = entry.model?.trim();
+		if (!model) {
+			return { error: "该接口不支持 /models 列表，请先填写默认模型 ID 后再测试（测试需要一个有效模型名做最小对话验证）" };
+		}
+		return await pingChat(entry.api, base, model, apiKey);
+	} catch (err) {
+		return { error: `连接失败：${err instanceof Error ? err.message : String(err)}` };
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
+async function pingChat(api: ApiKind, base: string, model: string, apiKey: string): Promise<ProbeResult> {
+	const pingHeaders: Record<string, string> = { "content-type": "application/json" };
+	let url: string;
+	let body: unknown;
+	if (api === "anthropic-messages") {
+		url = `${base}/v1/messages`;
+		pingHeaders["x-api-key"] = apiKey;
+		pingHeaders["anthropic-version"] = "2023-06-01";
+		body = { model, max_tokens: 1, messages: [{ role: "user", content: "hi" }] };
+	} else {
+		url = `${base}/chat/completions`;
+		pingHeaders.authorization = `Bearer ${apiKey}`;
+		body = { model, max_tokens: 1, messages: [{ role: "user", content: "hi" }] };
+	}
+	const ctl = new AbortController();
+	const timer = setTimeout(() => ctl.abort(), 15000);
+	try {
+		const res = await fetch(url, { method: "POST", headers: pingHeaders, body: JSON.stringify(body), signal: ctl.signal });
+		if (res.ok) {
+			return {
+				models: [],
+				fallback: true,
+				note: "连接成功，但该接口不支持 /models 列表，默认模型请手动填写",
+			};
+		}
+		const text = await res.text().catch(() => "");
+		if (res.status === 401 || res.status === 403) {
+			return { error: `连接已通，但 key 被拒绝（HTTP ${res.status}）：${text.slice(0, 200)}` };
+		}
+		if (res.status === 404) {
+			return { error: "对话端点同样 404，请检查接口地址是否正确" };
+		}
+		return { error: `对话验证失败（HTTP ${res.status}）：${text.slice(0, 200)}` };
 	} catch (err) {
 		return { error: `连接失败：${err instanceof Error ? err.message : String(err)}` };
 	} finally {
