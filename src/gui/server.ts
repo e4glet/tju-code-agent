@@ -3,7 +3,7 @@ import { randomBytes } from "node:crypto";
 import { readFile, readdir, stat } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createAgent } from "../create-agent.ts";
+import { buildAgentTools, createAgent, type CreateAgentOptions } from "../create-agent.ts";
 import { PROVIDER_ENTRIES } from "../config.ts";
 import { describeDataRoot, resolveDataRoot } from "../data-root.ts";
 import {
@@ -18,13 +18,14 @@ import {
 	type UserProviderEntry,
 } from "../providers.ts";
 import { cleanupRuns, EventLog, isSafeRunId, listRuns, readRunEvents, readRunEventsStream, removeRun, removeRuns, summarizeRuns } from "../core/event-log.ts";
-import { createApprovalGate } from "../core/permission.ts";
+import { createApprovalGate, type ApprovalAnswer, type ApprovalRequest } from "../core/permission.ts";
 import { SessionStore, type WorkItem } from "../core/session-store.ts";
 import { normalizeReasoningEffort, type ReasoningEffort } from "../core/reasoning-effort.ts";
 import type { CliFlags, RunConfig } from "../config.ts";
 import type { TodoStore, UserMessage } from "../core/types.ts";
 import { APP_JS, STYLE_CSS, VIEW_HTML } from "./ui.ts";
 import { AttachmentStore } from "./attachment-store.ts";
+import { checkCwdConfirm, listChildDirs, resolveWorkdirInput, type CwdPending } from "./workdir.ts";
 import { APP_VERSION } from "../version.ts";
 import {
 	checkForUpdate,
@@ -58,8 +59,15 @@ export async function startGuiServer(config: RunConfig, flags: CliFlags): Promis
 	const cwd = process.env.TJU_CODE_CWD ?? process.cwd();
 
 	const clients = new Set<SseClient>();
-	const pendingApprovals = new Map<string, (mode: boolean | "always") => void>();
+	const pendingApprovals = new Map<string, { resolve: (mode: ApprovalAnswer) => void; request: ApprovalRequest }>();
+	const pendingCwd = new Map<string, CwdPending>();
+	const CWD_PENDING_TTL_MS = 10 * 60 * 1000;
+	const pendingQuestions = new Map<
+		string,
+		{ resolve: (choice: string | null) => void; request: { requestId: string; question: string; options: string[] } }
+	>();
 	const token = randomBytes(16).toString("hex");
+	const confirmNonce = randomBytes(16).toString("hex");
 
 	const dataRoot = resolveDataRoot();
 	const logDir = config.logDir ?? join(dataRoot, "logs");
@@ -79,6 +87,11 @@ export async function startGuiServer(config: RunConfig, flags: CliFlags): Promis
 	const makeRunId = (): string => `${Date.now()}-${randomBytes(3).toString("hex")}`;
 	const makeWorkId = (): string => `${Date.now()}-${randomBytes(3).toString("hex")}`;
 
+	const trackWork = (id: string): void => {
+		currentWorkId = id;
+		agent.provider.sessionId = id;
+	};
+
 	// `bump` controls whether saving counts as "use": only actual runs (turn_end /
 	// agent_end) bump updatedAt so the item is sorted as most recently used.
 	// Switching away preserves the latest messages without reordering.
@@ -88,7 +101,7 @@ export async function startGuiServer(config: RunConfig, flags: CliFlags): Promis
 		const item: WorkItem = {
 			id: currentWorkId,
 			title: existing?.title ?? "未命名工作项",
-			cwd,
+			cwd: activeCwd,
 			model: agent.state.model,
 			providerEntryId: agent.provider.entryId,
 			messages: agent.state.messages,
@@ -138,9 +151,10 @@ export async function startGuiServer(config: RunConfig, flags: CliFlags): Promis
 		await agent.waitForIdle();
 		workTodos.todos = item.todos.slice();
 		agent.restore({ messages: item.messages, todos: item.todos });
+		await applyCwd(item.cwd || cwd);
 		const fellBack = restoreProvider(item.providerEntryId, item.model?.id);
 		agent.setModel({ ...agent.state.model, reasoningEffort: workEffort(item) });
-		currentWorkId = id;
+		trackWork(id);
 		await sessionStore.setLastActive(id);
 		// Re-sync the browser's model/effort display with the reopened work item.
 		broadcast({ kind: "state", state: agent.state, work: null });
@@ -165,10 +179,22 @@ export async function startGuiServer(config: RunConfig, flags: CliFlags): Promis
 	const requestToken = (req: IncomingMessage): string | undefined => {
 		const header = req.headers["x-agent-token"];
 		if (typeof header === "string" && header) return header;
-		return new URL(req.url ?? "/", "http://localhost").searchParams.get("token") ?? undefined;
+		return undefined;
 	};
 	const isAuthorized = (req: IncomingMessage): boolean =>
 		isTrustedOrigin(req) && requestToken(req) === token;
+
+	/** Authorized through a short-lived attachment ticket instead of the token. */
+	const isTicketAuthorized = (req: IncomingMessage, ticket: string | null): boolean => {
+		if (!isTrustedOrigin(req) || !ticket) return false;
+		const expires = attachmentTickets.get(ticket);
+		if (expires === undefined) return false;
+		if (expires <= Date.now()) {
+			attachmentTickets.delete(ticket);
+			return false;
+		}
+		return true;
+	};
 	const renderHtml = (): string => {
 		let html = VIEW_HTML.replaceAll("__AGENT_TOKEN__", token);
 		html = html.replace("__PLUGIN_SCRIPTS__", pluginTags);
@@ -176,23 +202,73 @@ export async function startGuiServer(config: RunConfig, flags: CliFlags): Promis
 	};
 	const renderJs = (): string => APP_JS.replaceAll("__AGENT_TOKEN__", token);
 
-	const pluginsDir = join(process.cwd(), "plugins");
-	let pluginTags = "";
-
-	const scanPlugins = async (): Promise<void> => {
-		const tags: string[] = [];
-		try {
-			const entries = await readdir(pluginsDir, { withFileTypes: true });
-			for (const entry of entries) {
-				if (!entry.isDirectory()) continue;
-				try {
-					await stat(join(pluginsDir, entry.name, "pet.js"));
-					tags.push(`<script src="/plugins/${entry.name}/pet.js"></script>`);
-				} catch { /* no pet.js, skip */ }
-			}
-		} catch { /* no plugins dir, skip */ }
-		pluginTags = tags.join("\n");
+	// Short-lived tickets for URLs that cannot carry headers (attachment images
+	// referenced from `<img src>`, and the event stream). The session token itself
+	// is never accepted from a query string.
+	const attachmentTickets = new Map<string, number>();
+	const ATTACHMENT_TICKET_TTL_MS = 10 * 60 * 1000;
+	const issueAttachmentTicket = (): string => {
+		const now = Date.now();
+		for (const [id, expires] of attachmentTickets) {
+			if (expires <= now) attachmentTickets.delete(id);
+		}
+		const id = randomBytes(16).toString("hex");
+		attachmentTickets.set(id, now + ATTACHMENT_TICKET_TTL_MS);
+		return id;
 	};
+
+	const pluginsDir = join(cwd, "plugins");
+	const pluginRelDirs: string[] = [];
+	let pluginTags = "";
+	const pluginNames: string[] = [];
+
+	// Plugin scripts run in the GUI's own origin and can therefore read the
+	// session token and drive the agent (approve directory access, exfiltrate the
+	// transcript). The plugin directory lives in the agent's writable workspace,
+	// so "auto-load whatever is on disk" would turn any file write — including one
+	// done under prompt injection — into code execution in this origin. Hence the
+	// allowlist is computed once, at startup, from the directories present then:
+	// adding a plugin requires a restart, which the CLI announces below.
+	const scanPlugins = async (): Promise<Set<string>> => {
+		const allowed = new Set<string>();
+		let entries;
+		try {
+			entries = await readdir(pluginsDir, { withFileTypes: true });
+		} catch {
+			return allowed; // no plugins dir, skip
+		}
+		for (const entry of entries) {
+			if (!entry.isDirectory()) continue;
+			if (entry.name.startsWith(".") || entry.name.includes("..")) continue;
+			const relDir = entry.name;
+			try {
+				const info = await stat(join(pluginsDir, relDir, ENTRY_FILE));
+				if (!info.isFile()) continue;
+			} catch {
+				continue; // no entry file, skip
+			}
+			// Every file inside the plugin directory is enumerable by the route
+			// below, so the allowlist covers the whole tree, not just the entry.
+			for (const rel of await listPluginFiles(relDir)) {
+				allowed.add(`${relDir}/${rel}`);
+			}
+			pluginRelDirs.push(relDir);
+			pluginNames.push(relDir);
+			// `relDir` comes from the filesystem, so it is escaped before being
+			// embedded in HTML:
+			// a directory name may legally contain `"` on Linux/macOS, which
+			// would otherwise close the attribute and inject markup.
+			const src = `/plugins/${relDir.split("/").map(encodeURIComponent).join("/")}/${ENTRY_FILE}`;
+			pluginTags += `<script src="${escHtml(src)}"></script>\n`;
+		}
+		return allowed;
+	};
+
+	// Only plugin files that already existed when the process started are served,
+	// and never after the process exits: the agent has write access to the
+	// workspace, so a plugin written mid-session must not become executable in
+	// the GUI origin without the user restarting and thus re-consenting.
+	const allowedPluginFiles = await scanPlugins();
 
 	const moduleDir = dirname(fileURLToPath(import.meta.url));
 	const makeAssetLoader = (fileName: string) => {
@@ -228,6 +304,35 @@ export async function startGuiServer(config: RunConfig, flags: CliFlags): Promis
 		}
 	};
 
+	const makeApprovalGate = (dir: string): NonNullable<CreateAgentOptions["beforeToolCall"]> =>
+		createApprovalGate({
+			workdir: dir,
+			ask: (request) => {
+				return new Promise<ApprovalAnswer>((resolve) => {
+					pendingApprovals.set(request.requestId, { resolve, request });
+					broadcast({ kind: "approval", request });
+				});
+			},
+		});
+
+	const askUserHandler: NonNullable<CreateAgentOptions["askUser"]> = (request, signal) => {
+		return new Promise<string>((resolve, reject) => {
+			const toolCallId = `${Date.now()}-${randomBytes(3).toString("hex")}`;
+			const full = { requestId: toolCallId, ...request };
+			pendingQuestions.set(toolCallId, {
+				resolve: (choice) => {
+					if (choice === null) reject(new Error("Question cancelled"));
+					else resolve(choice);
+				},
+				request: full,
+			});
+			signal?.addEventListener("abort", () => {
+				if (pendingQuestions.delete(toolCallId)) reject(new Error("Question cancelled"));
+			}, { once: true });
+			broadcast({ kind: "question", request: full });
+		});
+	};
+
 	const agent = createAgent({
 		config,
 		cwd,
@@ -236,16 +341,38 @@ export async function startGuiServer(config: RunConfig, flags: CliFlags): Promis
 			if (!currentWorkId) return null;
 			return await attachmentStore.readBytes(currentWorkId, attachment.id);
 		},
-		beforeToolCall: createApprovalGate({
-			workdir: cwd,
-			ask: (request) => {
-				return new Promise<boolean | "always">((resolve) => {
-					pendingApprovals.set(request.requestId, resolve);
-					broadcast({ kind: "approval", request });
-				});
-			},
-		}),
+		beforeToolCall: makeApprovalGate(cwd),
+		askUser: askUserHandler,
 	});
+
+	let activeCwd = cwd;
+	const sameDir = (a: string, b: string): boolean => {
+		if (process.platform === "win32") {
+			a = a.toLowerCase();
+			b = b.toLowerCase();
+		}
+		return a.replace(/[\\/]+$/, "") === b.replace(/[\\/]+$/, "");
+	};
+	const applyCwd = async (dir: string): Promise<void> => {
+		if (!dir || sameDir(dir, activeCwd)) return;
+		const checked = await resolveWorkdirInput(dir);
+		if (checked.error || !checked.dir) {
+			console.error(`[warn] 工作项工作目录无效（${checked.error ?? "未知错误"}），已保留原目录 ${activeCwd}`);
+			return;
+		}
+		const gate = makeApprovalGate(checked.dir);
+		agent.setBeforeToolCall(gate);
+		agent.setTools(
+			buildAgentTools(agent, {
+				cwd: checked.dir,
+				maxTokens: config.maxTokens,
+				todoStore: workTodos,
+				beforeToolCall: gate,
+				askUser: askUserHandler,
+			}),
+		);
+		activeCwd = checked.dir;
+	};
 
 	agent.subscribe(async (event) => {
 		broadcast({ kind: "event", runId: currentRunId, event });
@@ -283,29 +410,39 @@ export async function startGuiServer(config: RunConfig, flags: CliFlags): Promis
 		if (item) {
 			workTodos.todos = item.todos.slice();
 			agent.restore({ messages: item.messages, todos: item.todos });
-			// An explicit --profile (including the launcher auto-select) expresses
-			// which interface to use right now and wins over the stored work item;
-			// otherwise the previous session's interface would silently override
-			// every freshly double-clicked launcher script.
-			const explicitProfile = typeof flags.profile === "string" && flags.profile;
+			await applyCwd(item.cwd || cwd);
+			// A hand-written --profile or a freshly imported/refreshed launcher
+			// entry expresses which interface to use right now and wins over the
+			// stored work item; otherwise the previous session's interface would
+			// silently override every freshly double-clicked launcher script. A
+			// profile carried over from an unchanged script (kept) or the empty-
+			// script fallback is stale by definition: the work item's own saved
+			// interface (i.e. the last dropdown pick) wins instead.
+			const explicitProfile =
+				typeof flags.profile === "string" && !!flags.profile && !flags.launcherProfileStale;
 			if (!explicitProfile && restoreProvider(item.providerEntryId, item.model?.id)) {
 				console.error(`[warn] work item "${item.title}" 的接口已不存在，已切到默认接口`);
 			}
 			agent.setModel({ ...agent.state.model, reasoningEffort: workEffort(item) });
-			currentWorkId = item.id;
+			trackWork(item.id);
 		} else {
+			// No work items at all: nothing to restore from, so honor the startup
+			// profile (hand-written, fresh launcher import, or fallback) as-is.
+			if (typeof flags.profile === "string" && flags.profile) {
+				restoreProvider(flags.profile, undefined);
+			}
 			const id = makeWorkId();
 			await sessionStore.save({
 				id,
 				title: "未命名工作项",
-				cwd,
+				cwd: activeCwd,
 				model: agent.state.model,
 				messages: [],
 				todos: [],
 				createdAt: Date.now(),
 				updatedAt: Date.now(),
 			});
-			currentWorkId = id;
+			trackWork(id);
 		}
 		await sessionStore.setLastActive(currentWorkId);
 	};
@@ -318,28 +455,28 @@ export async function startGuiServer(config: RunConfig, flags: CliFlags): Promis
 
 		try {
 			if (req.method === "GET" && (pathname === "/" || pathname === "/index.html")) {
-				res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-cache" });
+				res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-cache", ...SECURITY_HEADERS });
 				res.end(renderHtml());
 				return;
 			}
 			if (req.method === "GET" && pathname === "/style.css") {
-				res.writeHead(200, { "content-type": "text/css; charset=utf-8", "cache-control": "no-cache" });
+				res.writeHead(200, { "content-type": "text/css; charset=utf-8", "cache-control": "no-cache", ...SECURITY_HEADERS });
 				res.end(STYLE_CSS);
 				return;
 			}
 			if (req.method === "GET" && pathname === "/app.js") {
-				res.writeHead(200, { "content-type": "text/javascript; charset=utf-8", "cache-control": "no-cache" });
+				res.writeHead(200, { "content-type": "text/javascript; charset=utf-8", "cache-control": "no-cache", ...SECURITY_HEADERS });
 				res.end(renderJs());
 				return;
 			}
 			if (req.method === "GET" && pathname === "/favicon.ico") {
 				const buf = await loadFavicon();
 				if (!buf) {
-					res.writeHead(404);
+					res.writeHead(404, SECURITY_HEADERS);
 					res.end();
 					return;
 				}
-				res.writeHead(200, { "content-type": "image/x-icon", "cache-control": "public, max-age=86400" });
+				res.writeHead(200, { "content-type": "image/x-icon", "cache-control": "public, max-age=86400", ...SECURITY_HEADERS });
 				res.end(buf);
 				return;
 			}
@@ -350,34 +487,52 @@ export async function startGuiServer(config: RunConfig, flags: CliFlags): Promis
 					res.end();
 					return;
 				}
-				res.writeHead(200, { "content-type": "image/png", "cache-control": "public, max-age=86400" });
+				res.writeHead(200, { "content-type": "image/png", "cache-control": "public, max-age=86400", ...SECURITY_HEADERS });
 				res.end(buf);
 				return;
 			}
 
 			if (req.method === "GET" && pathname.startsWith("/plugins/")) {
-				const rel = pathname.slice("/plugins/".length);
-				if (rel && !rel.includes("..")) {
-					const filePath = join(pluginsDir, rel);
-					try {
-						const fileStat = await stat(filePath);
-						if (fileStat.isFile()) {
-							const data = await readFile(filePath);
-							const ext = rel.split(".").pop()?.toLowerCase();
-							const ct: Record<string, string> = { js: "text/javascript; charset=utf-8", css: "text/css; charset=utf-8", webp: "image/webp", png: "image/png", jpg: "image/jpeg", ico: "image/x-icon", svg: "image/svg+xml" };
-							const cacheHeader = ext === "js" || ext === "css" ? "no-cache" : "public, max-age=3600";
-							res.writeHead(200, { "content-type": ct[ext ?? ""] ?? "application/octet-stream", "cache-control": cacheHeader });
-							res.end(data);
-							return;
-						}
-					} catch { /* not found */ }
+				// Decoded once, then matched against the startup allowlist, so the
+				// filesystem is never touched with a caller-supplied path: a
+				// traversal attempt simply is not in the set.
+				let rel: string;
+				try {
+					rel = decodeURIComponent(pathname.slice("/plugins/".length));
+				} catch {
+					rel = "";
 				}
-				res.writeHead(404);
+				const ext = rel.split(".").pop()?.toLowerCase() ?? "";
+				if (rel && allowedPluginFiles.has(rel) && PLUGIN_MIME[ext]) {
+					try {
+						const data = await readFile(join(pluginsDir, ...rel.split("/")));
+						const cacheHeader = ext === "js" || ext === "css" ? "no-cache" : "public, max-age=3600";
+						res.writeHead(200, {
+							"content-type": PLUGIN_MIME[ext] ?? "application/octet-stream",
+							"cache-control": cacheHeader,
+							...SECURITY_HEADERS,
+						});
+						res.end(data);
+						return;
+					} catch {
+						// fall through to 404
+					}
+				}
+				res.writeHead(404, SECURITY_HEADERS);
 				res.end();
 				return;
 			}
 
-			if (pathname.startsWith("/api/") && !isAuthorized(req)) {
+			// The one route reachable without the token header: `<img src>` cannot
+			// set headers, so it authenticates with a short-lived ticket instead.
+			// It has to be exempted *here*, before the generic token check, or the
+			// request would be rejected as unauthorized and never reach its handler.
+			const isTicketOnlyRequest =
+				req.method === "GET" &&
+				pathname.startsWith("/api/attachments/") &&
+				isTicketAuthorized(req, url.searchParams.get("t"));
+
+			if (pathname.startsWith("/api/") && !isAuthorized(req) && !isTicketOnlyRequest) {
 				writeJson(res, 403, { error: "Forbidden" });
 				return;
 			}
@@ -387,6 +542,7 @@ export async function startGuiServer(config: RunConfig, flags: CliFlags): Promis
 					"content-type": "text/event-stream; charset=utf-8",
 					"cache-control": "no-cache",
 					connection: "keep-alive",
+					...SECURITY_HEADERS,
 				});
 				await activeLog?.flush();
 				res.write(": connected\n\n");
@@ -395,6 +551,10 @@ export async function startGuiServer(config: RunConfig, flags: CliFlags): Promis
 					`data: ${JSON.stringify({
 						kind: "state",
 						state: agent.state,
+						// Handed out over the stream so `<img>` URLs for attachments
+						// can be authorized without the session token ever appearing
+						// in a URL (see issueAttachmentTicket).
+						ticket: issueAttachmentTicket(),
 						work: initialWork ? { id: initialWork.id, title: initialWork.title, messages: initialWork.messages } : null,
 					})}\n\n`,
 				);
@@ -402,6 +562,15 @@ export async function startGuiServer(config: RunConfig, flags: CliFlags): Promis
 					for await (const entry of readRunEventsStream(logDir, currentRunId)) {
 						res.write(`data: ${JSON.stringify({ kind: "replay", runId: entry.runId, event: entry.event })}\n\n`);
 					}
+				}
+				// A refresh while the run waits on the user would otherwise lose
+				// the prompt with no way to get it back: re-issue anything still
+				// pending so the reconnected page can answer it.
+				for (const [, pending] of pendingApprovals) {
+					res.write(`data: ${JSON.stringify({ kind: "approval", request: pending.request })}\n\n`);
+				}
+				for (const [, pending] of pendingQuestions) {
+					res.write(`data: ${JSON.stringify({ kind: "question", request: pending.request })}\n\n`);
 				}
 				const client: SseClient = {
 					res,
@@ -418,8 +587,20 @@ export async function startGuiServer(config: RunConfig, flags: CliFlags): Promis
 				return;
 			}
 
+			// Ticket for URL-borne (header-less) requests. Issued on demand so the
+			// page does not have to know about the event stream to get one.
+			if (pathname === "/api/ticket" && req.method === "POST") {
+				writeJson(res, 200, { ticket: issueAttachmentTicket() });
+				return;
+			}
+
 			if (pathname === "/api/state" && req.method === "GET") {
 				writeJson(res, 200, agent.state);
+				return;
+			}
+
+			if (pathname === "/api/cwd" && req.method === "GET") {
+				writeJson(res, 200, { ok: true, cwd });
 				return;
 			}
 
@@ -532,16 +713,40 @@ export async function startGuiServer(config: RunConfig, flags: CliFlags): Promis
 				}
 				const name = url.searchParams.get("name") ?? "image";
 				const mime = url.searchParams.get("mime") ?? "application/octet-stream";
-				if (!mime.startsWith("image/")) {
-					writeJson(res, 400, { error: "Only image files are supported for now" });
-					return;
+				// The extension decides, but pasted clipboard images often carry no
+				// filename at all (client falls back to "image-N"): fall back to
+				// the declared mime in that case instead of rejecting the upload.
+				// Either way the stored mime comes from our own table, never from
+				// the client string, so SVG-as-image stays excluded.
+				const mimeByExt: Record<string, string> = {
+					png: "image/png",
+					jpg: "image/jpeg",
+					jpeg: "image/jpeg",
+					gif: "image/gif",
+					webp: "image/webp",
+				};
+				const ext = (name.split(".").pop() ?? "").toLowerCase();
+				let storedMime = mimeByExt[ext];
+				if (!storedMime) {
+					const declared = mime.toLowerCase().split(";")[0]?.trim() ?? "";
+					const extByMime: Record<string, string> = {
+						"image/png": "image/png",
+						"image/jpeg": "image/jpeg",
+						"image/gif": "image/gif",
+						"image/webp": "image/webp",
+					};
+					storedMime = extByMime[declared];
+					if (!storedMime) {
+						writeJson(res, 400, { error: `不支持的文件类型（仅支持 png/jpg/gif/webp）：${name}` });
+						return;
+					}
 				}
 				const bytes = await readRawBody(req, MAX_UPLOAD_BYTES);
 				if (!bytes) {
 					writeJson(res, 413, { error: `File too large (limit ${MAX_UPLOAD_BYTES / 1024 / 1024} MiB)` });
 					return;
 				}
-				const attachment = await attachmentStore.save(currentWorkId, { name, mime, kind: "image" }, bytes);
+				const attachment = await attachmentStore.save(currentWorkId, { name, mime: storedMime, kind: "image" }, bytes);
 				writeJson(res, 200, { ok: true, attachment });
 				return;
 			}
@@ -559,6 +764,7 @@ export async function startGuiServer(config: RunConfig, flags: CliFlags): Promis
 					"content-type": meta.mime,
 					"content-length": bytes.byteLength,
 					"cache-control": "private, max-age=3600",
+					...SECURITY_HEADERS,
 				});
 				res.end(Buffer.from(bytes));
 				return;
@@ -567,11 +773,18 @@ export async function startGuiServer(config: RunConfig, flags: CliFlags): Promis
 			if (pathname === "/api/abort" && req.method === "POST") {
 				agent.abort();
 				if (pendingApprovals.size > 0) {
-					for (const [requestId, resolve] of pendingApprovals) {
+					for (const [requestId, pending] of pendingApprovals) {
 						pendingApprovals.delete(requestId);
-						resolve(false);
+						pending.resolve(false);
 					}
 					broadcast({ kind: "approval", request: null });
+				}
+				if (pendingQuestions.size > 0) {
+					for (const [, pending] of pendingQuestions) {
+						pending.resolve(null);
+					}
+					pendingQuestions.clear();
+					broadcast({ kind: "question", request: null });
 				}
 				writeJson(res, 200, { ok: true });
 				return;
@@ -584,6 +797,33 @@ export async function startGuiServer(config: RunConfig, flags: CliFlags): Promis
 					agent.resetTranscript();
 					writeJson(res, 200, { ok: true });
 				}
+				return;
+			}
+
+			if (pathname === "/api/revert" && req.method === "POST") {
+				const body = await readBody(req);
+				const timestamp = typeof body.timestamp === "number" ? body.timestamp : NaN;
+				if (!Number.isFinite(timestamp)) {
+					writeJson(res, 400, { error: "需要提供 timestamp" });
+					return;
+				}
+				if (agent.streaming) {
+					writeJson(res, 409, { error: "任务执行中，请先停止后再回退" });
+					return;
+				}
+				const target = agent.state.messages.find((m) => m.timestamp === timestamp);
+				const restored =
+					target && target.role === "user"
+						? { text: target.content, attachments: target.attachments ?? [] }
+						: null;
+				try {
+					agent.revertTo(timestamp);
+				} catch (err) {
+					writeJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
+					return;
+				}
+				await saveCurrentWork();
+				writeJson(res, 200, { ok: true, messages: agent.state.messages, restored });
 				return;
 			}
 
@@ -668,7 +908,7 @@ export async function startGuiServer(config: RunConfig, flags: CliFlags): Promis
 
 			const providerDeleteMatch = pathname.match(/^\/api\/providers\/([^/]+)$/);
 			if (providerDeleteMatch && providerDeleteMatch[1] && req.method === "DELETE") {
-				const result = deleteUserEntry(decodeURIComponent(providerDeleteMatch[1]));
+				const result = deleteUserEntry(decodePathSegment(providerDeleteMatch[1]));
 				if ("error" in result) {
 					writeJson(res, 400, { error: result.error });
 					return;
@@ -718,8 +958,20 @@ export async function startGuiServer(config: RunConfig, flags: CliFlags): Promis
 					writeJson(res, 400, { error: "需要 entryId" });
 					return;
 				}
+				// Only ids that exist in the merged table (builtin + user) may be
+				// written, so secrets.json cannot accumulate arbitrary attacker-named
+				// keys — it is read into memory on every provider resolution.
+				if (!loadProviderTable(PROVIDER_ENTRIES).table[entryId]) {
+					writeJson(res, 404, { error: `未知接口：${entryId}` });
+					return;
+				}
+				const key = typeof body.key === "string" && body.key ? body.key : null;
+				if (key !== null && (key.length > MAX_SECRET_CHARS || key.includes("\n") || key.includes("\r"))) {
+					writeJson(res, 400, { error: "API key 长度或格式非法" });
+					return;
+				}
 				try {
-					writeSecret(entryId, typeof body.key === "string" && body.key ? body.key : null);
+					writeSecret(entryId, key);
 				} catch (err) {
 					writeJson(res, 500, { error: `写入失败：${err instanceof Error ? err.message : String(err)}` });
 					return;
@@ -855,16 +1107,33 @@ export async function startGuiServer(config: RunConfig, flags: CliFlags): Promis
 				const body = await readBody(req);
 				const requestId = typeof body.requestId === "string" ? body.requestId : "";
 				const mode = body.mode;
-				let value: boolean | "always" = true;
-				if (mode === "always") value = "always";
-				else if (mode === "deny" || body.approve === false) value = false;
-				const resolve = requestId ? pendingApprovals.get(requestId) : undefined;
+				let value: ApprovalAnswer = true;
+				if (mode === "always") {
+					const scope = typeof body.scope === "string" ? body.scope : "";
+					value = scope && scope.length < 4096 ? { scope } : "always";
+				} else if (mode === "deny" || body.approve === false) value = false;
+				const resolve = requestId ? pendingApprovals.get(requestId)?.resolve : undefined;
 				if (resolve) {
 					pendingApprovals.delete(requestId);
 					resolve(value);
 					writeJson(res, 200, { ok: true });
 				} else {
 					writeJson(res, 404, { error: `No pending approval: ${requestId}` });
+				}
+				return;
+			}
+
+			if (pathname === "/api/question/answer" && req.method === "POST") {
+				const body = await readBody(req);
+				const requestId = typeof body.requestId === "string" ? body.requestId : "";
+				const choice = typeof body.choice === "string" ? body.choice : "";
+				const resolve = requestId ? pendingQuestions.get(requestId)?.resolve : undefined;
+				if (resolve) {
+					pendingQuestions.delete(requestId);
+					resolve(body.mode === "cancel" ? null : choice);
+					writeJson(res, 200, { ok: true });
+				} else {
+					writeJson(res, 404, { error: `No pending question: ${requestId}` });
 				}
 				return;
 			}
@@ -877,25 +1146,33 @@ export async function startGuiServer(config: RunConfig, flags: CliFlags): Promis
 			}
 
 			if (pathname === "/api/works" && req.method === "POST") {
-				if (agent.streaming) {
-					writeJson(res, 409, { error: "Agent is busy; abort first." });
-					return;
-				}
 				const body = await readBody(req);
 				const title = typeof body.title === "string" ? body.title.trim() : "";
+				const resolved = await resolveWorkdirInput(body.cwd);
+				if (resolved.error) {
+					writeJson(res, 400, { error: resolved.error });
+					return;
+				}
 				const id = makeWorkId();
+				const requested = resolved.dir && !sameDir(resolved.dir, activeCwd) ? resolved.dir : null;
 				await sessionStore.save({
 					id,
 					title: title || "未命名工作项",
-					cwd,
+					cwd: requested ? cwd : (resolved.dir ?? cwd),
 					model: agent.state.model,
 					messages: [],
 					todos: [],
 					createdAt: Date.now(),
 					updatedAt: Date.now(),
 				});
+				if (requested) pendingCwd.set(id, { dir: requested, until: Date.now() + CWD_PENDING_TTL_MS });
+				if (agent.streaming) {
+					broadcast({ kind: "works" });
+					writeJson(res, 200, requested ? { ok: true, id, switched: false, pending: true, cwd: requested } : { ok: true, id, switched: false });
+					return;
+				}
 				await openWork(id);
-				writeJson(res, 200, { ok: true, id });
+				writeJson(res, 200, requested ? { ok: true, id, switched: true, pending: true, cwd: requested } : { ok: true, id, switched: true });
 				return;
 			}
 
@@ -932,6 +1209,68 @@ export async function startGuiServer(config: RunConfig, flags: CliFlags): Promis
 				return;
 			}
 
+			const workCwdMatch = pathname.match(/^\/api\/works\/([^/]+)\/cwd$/);
+			if (workCwdMatch && workCwdMatch[1] && req.method === "POST") {
+				const id = workCwdMatch[1];
+				const body = await readBody(req);
+				const raw = typeof body.cwd === "string" ? body.cwd : "";
+				if (!raw.trim()) {
+					writeJson(res, 400, { error: "需要提供工作目录" });
+					return;
+				}
+				const item = await sessionStore.load(id);
+				if (!item) {
+					writeJson(res, 404, { error: "Work item not found" });
+					return;
+				}
+				if (body.confirm === true) {
+					const now = Date.now();
+					for (const [pid, pending] of pendingCwd) {
+						if (pending.until <= now) pendingCwd.delete(pid);
+					}
+					const resolved = await resolveWorkdirInput(raw);
+					const problem = checkCwdConfirm(pendingCwd.get(id), resolved.dir ?? null, body.nonce, confirmNonce, now);
+					if (problem) {
+						writeJson(res, problem.status, { error: problem.error });
+						return;
+					}
+					if (id === currentWorkId && agent.streaming) {
+						writeJson(res, 409, { error: "任务执行中，请等本轮结束后再改目录" });
+						return;
+					}
+					pendingCwd.delete(id);
+					const dir = resolved.dir;
+					if (!dir) {
+						writeJson(res, 400, { error: "确认已过期，请重新发起目录变更" });
+						return;
+					}
+					item.cwd = dir;
+					await sessionStore.save(item);
+					if (id === currentWorkId) await applyCwd(dir);
+					writeJson(res, 200, { ok: true, cwd: dir });
+					return;
+				}
+				const resolved = await resolveWorkdirInput(raw);
+				if (resolved.error || !resolved.dir) {
+					writeJson(res, 400, { error: resolved.error ?? "工作目录无效" });
+					return;
+				}
+				pendingCwd.set(id, { dir: resolved.dir, until: Date.now() + CWD_PENDING_TTL_MS });
+				writeJson(res, 202, { pending: true, cwd: resolved.dir });
+				return;
+			}
+
+			if (pathname === "/api/fs/browse" && req.method === "GET") {
+				const start = url.searchParams.get("path") || activeCwd;
+				const result = await listChildDirs(start);
+				if (result.error || !result.listing) {
+					writeJson(res, 400, { error: result.error ?? "目录无效" });
+					return;
+				}
+				writeJson(res, 200, { ok: true, ...result.listing });
+				return;
+			}
+
 			const workDeleteMatch = pathname.match(/^\/api\/works\/([^/]+)$/);
 			if (workDeleteMatch && workDeleteMatch[1] && req.method === "DELETE") {
 				const id = workDeleteMatch[1];
@@ -948,13 +1287,14 @@ export async function startGuiServer(config: RunConfig, flags: CliFlags): Promis
 						active = await sessionStore.load(next.id);
 						workTodos.todos = active ? active.todos.slice() : [];
 						agent.restore({ messages: active ? active.messages : [], todos: workTodos.todos });
-						currentWorkId = next.id;
+						await applyCwd(active?.cwd || cwd);
+						trackWork(next.id);
 					} else {
 						const freshId = makeWorkId();
 						active = {
 							id: freshId,
 							title: "未命名工作项",
-							cwd,
+							cwd: activeCwd,
 							model: agent.state.model,
 							messages: [],
 							todos: [],
@@ -964,7 +1304,7 @@ export async function startGuiServer(config: RunConfig, flags: CliFlags): Promis
 						await sessionStore.save(active);
 						workTodos.todos = [];
 						agent.restore({ messages: [], todos: [] });
-						currentWorkId = freshId;
+						trackWork(freshId);
 					}
 				}
 				await sessionStore.remove(id);
@@ -1009,10 +1349,17 @@ export async function startGuiServer(config: RunConfig, flags: CliFlags): Promis
 	console.log(`tju-code GUI: ${url}`);
 	console.log(`Model: ${config.api} / ${config.model}`);
 	console.log(`Session token: ${token} (required for /api/* requests)`);
+	if (pluginNames.length > 0) {
+		// Plugin scripts execute in the GUI origin. Loading them is a decision the
+		// user should see, not a silent side effect of dropping a folder in place.
+		console.log(`Plugins loaded: ${pluginNames.join(", ")} (new plugins need a restart)`);
+	}
 	console.log("Press Ctrl+C to stop.");
 
 	if (open) {
-		await openBrowser(url);
+		await openBrowser(`${url}#t=${token};n=${confirmNonce}`);
+	} else {
+		console.log(`GUI open URL (contains session secrets, do not share): ${url}#t=${token};n=${confirmNonce}`);
 	}
 
 	// Graceful shutdown: flush the current work item so a Ctrl+C / SIGTERM exit
@@ -1036,13 +1383,91 @@ function workEffort(item: WorkItem): ReasoningEffort {
 	return normalizeReasoningEffort(item.model?.reasoningEffort) ?? "high";
 }
 
+const ENTRY_FILE = "pet.js";
+const MAX_PLUGIN_FILES = 200;
+const PLUGIN_MIME: Record<string, string> = {
+	js: "text/javascript; charset=utf-8",
+	css: "text/css; charset=utf-8",
+	webp: "image/webp",
+	png: "image/png",
+	jpg: "image/jpeg",
+	jpeg: "image/jpeg",
+	gif: "image/gif",
+	ico: "image/x-icon",
+	svg: "image/svg+xml",
+	json: "application/json; charset=utf-8",
+};
+
+function escHtml(value: string): string {
+	return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+/** Percent-decoding that never throws: a malformed escape ("%zz") must yield a
+ * miss, not an uncaught URIError surfacing as a 500. */
+function decodePathSegment(value: string): string {
+	try {
+		return decodeURIComponent(value);
+	} catch {
+		return value;
+	}
+}
+
 function writeJson(res: ServerResponse, status: number, body: unknown): void {
-	res.writeHead(status, { "content-type": "application/json; charset=utf-8" });
+	res.writeHead(status, { "content-type": "application/json; charset=utf-8", ...SECURITY_HEADERS });
 	res.end(JSON.stringify(body));
+}
+
+/**
+ * Response headers applied to every reply.
+ *
+ * `script-src 'self'` is the second line of defence: the GUI renders model and
+ * tool output through a hand-written markdown renderer, and any escaping mistake
+ * there would otherwise become arbitrary script execution in the origin that
+ * holds the session token and can drive the agent. No inline event handlers or
+ * inline `<style>` blocks are used by the page, so this costs nothing.
+ */
+const CSP = [
+	"default-src 'none'",
+	"script-src 'self'",
+	"style-src 'self' 'unsafe-inline'",
+	"img-src 'self' data: blob:",
+	"connect-src 'self'",
+	"font-src 'self'",
+	"base-uri 'none'",
+	"form-action 'none'",
+	"frame-ancestors 'none'",
+	"object-src 'none'",
+].join("; ");
+
+const SECURITY_HEADERS: Record<string, string> = {
+	"content-security-policy": CSP,
+	"x-content-type-options": "nosniff",
+	"referrer-policy": "no-referrer",
+	"x-frame-options": "DENY",
+};
+
+/** Recursive file listing of one plugin directory, as paths relative to it. */
+async function listPluginFiles(pluginDir: string, rel = "", out: string[] = []): Promise<string[]> {
+	if (out.length >= MAX_PLUGIN_FILES) return out;
+	let entries;
+	try {
+		entries = await readdir(join(pluginDir, rel), { withFileTypes: true });
+	} catch {
+		return out;
+	}
+	for (const entry of entries) {
+		if (out.length >= MAX_PLUGIN_FILES) break;
+		if (entry.name.startsWith(".")) continue;
+		const next = rel ? `${rel}/${entry.name}` : entry.name;
+		if (entry.isDirectory()) await listPluginFiles(pluginDir, next, out);
+		else if (entry.isFile()) out.push(next);
+	}
+	return out;
 }
 
 const MAX_BODY_BYTES = 1024 * 1024; // bound JSON request bodies
 const MAX_UPLOAD_BYTES = 30 * 1024 * 1024; // single image upload limit (30 MiB)
+const MAX_SECRET_CHARS = 8192; // sanity bound on a stored API key
 /** Upper bound on an explicit id list; condition-based deletes are uncapped. */
 const MAX_BATCH_DELETE = 500;
 

@@ -143,7 +143,7 @@ async function runLoop(
 				await emit({
 					type: "notice",
 					level: "warn",
-					message: `任务清单仍有未完成项，已自动延长本轮步数上限 +${TURN_RENEWAL_SIZE} 步（第 ${renewals}/${MAX_TURN_RENEWALS} 次，当前上限 ${maxTurns} 步）。`,
+					message: `任务仍有未完成项，已自动延长本轮步数上限 +${TURN_RENEWAL_SIZE} 步（第 ${renewals}/${MAX_TURN_RENEWALS} 次，当前上限 ${maxTurns} 步）。`,
 				});
 				continue;
 			}
@@ -160,7 +160,7 @@ async function runLoop(
 				type: "notice",
 				level: "warn",
 				message: planOpen
-					? `已达本轮步数上限（${maxTurns} 步）且自动续期已用尽，但任务清单仍有未完成项。已要求模型停止调用工具并汇总进度；发送新消息即可继续执行。`
+					? `已达本轮步数上限（${maxTurns} 步）且自动续期已用尽，但任务仍有未完成项。已要求模型停止调用工具并汇总进度；发送新消息即可继续执行。`
 					: `已达本轮步数上限（${maxTurns} 步）。已要求模型停止调用工具并汇总进度；发送新消息即可继续执行。`,
 			});
 
@@ -340,6 +340,7 @@ async function streamAssistantResponse(
 			apiKey: config.apiKey,
 			maxTokens: config.maxTokens,
 			temperature: config.temperature,
+			sessionId: config.sessionId,
 			signal,
 		});
 

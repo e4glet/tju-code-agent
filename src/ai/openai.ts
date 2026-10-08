@@ -2,7 +2,7 @@ import type { AssistantMessage, Message, Usage } from "../core/types.ts";
 import { EventStream } from "../core/event-stream.ts";
 import { normalizeReasoningEffort, type ReasoningEffort } from "../core/reasoning-effort.ts";
 import { readSse } from "./sse.ts";
-import { estimateTokens, fetchWithRetry, HttpError, parseJsonArguments, sanitizeMessages } from "./utils.ts";
+import { affinityHeaders, estimateTokens, fetchWithRetry, HttpError, parseJsonArguments, sanitizeMessages } from "./utils.ts";
 import type { Context, GroundEvent, ProviderAdapter, ProviderStreamOptions } from "./types.ts";
 
 type OpenAiChunk = {
@@ -176,6 +176,7 @@ async function runStream(
 					headers: {
 						"content-type": "application/json",
 						authorization: `Bearer ${apiKey}`,
+						...affinityHeaders(baseUrl, options?.sessionId),
 					},
 					body: JSON.stringify(body),
 					signal: options?.signal,

@@ -186,6 +186,26 @@ describe("resolveConfig", () => {
 		});
 	});
 
+	it("resolves the opencode go preset to its gateway and default model", () => {
+		const config = resolveConfig({ profile: "opencode" }, NO_ENV);
+		expect(config).toMatchObject({
+			api: "openai-completions",
+			provider: "opencode",
+			model: "deepseek-v4.1-flash",
+			baseUrl: "https://opencode.ai/zen/go/v1",
+		});
+	});
+
+	it("resolves the openai preset to its defaults", () => {
+		const config = resolveConfig({ profile: "openai" }, NO_ENV);
+		expect(config).toMatchObject({
+			api: "openai-completions",
+			provider: "openai",
+			model: "gpt-6.1-sol",
+			baseUrl: "https://api.openai.com/v1",
+		});
+	});
+
 	it("lets flags win over the profile and the environment", () => {
 		const config = resolveConfig(
 			{ profile: "deepseek", model: "flag-model", "api-key": "flag-key", "base-url": "https://flag.example" },

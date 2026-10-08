@@ -38,17 +38,21 @@ export function createGlobTool(cwd: string): AgentTool<typeof globSchema> {
 		name: "glob",
 		label: "glob",
 		description:
-			"Find files by name pattern without reading them. Use this to locate files before reading them; use grep to search inside file contents.",
+			"Find files by name pattern without reading them. Each match includes the file size in bytes, so use this to locate files and to check file sizes instead of shell for-loops. Use grep to search inside file contents.",
 		parameters: globSchema,
 		promptSnippet: "find files by name",
-		async execute(_call, { pattern, path }) {
+		async execute(call, { pattern, path }) {
 			const root = path ? (isAbsolute(path) ? path : resolve(cwd, path)) : cwd;
 			const matchNameOnly = !pattern.includes("/");
 			const nameRegex = matchNameOnly ? globToPathRegex(pattern) : null;
 			const pathRegex = matchNameOnly ? null : globToPathRegex(pattern);
-			const matches: string[] = [];
+			const matches: Array<{ file: string; size?: number }> = [];
+			const checkAborted = (): void => {
+				if (call.signal?.aborted) throw new Error("Search aborted");
+			};
 
 			const walk = async (dir: string): Promise<void> => {
+				checkAborted();
 				if (matches.length >= MAX_MATCHES) return;
 				let entries;
 				try {
@@ -57,6 +61,7 @@ export function createGlobTool(cwd: string): AgentTool<typeof globSchema> {
 					return;
 				}
 				for (const entry of entries) {
+					checkAborted();
 					if (matches.length >= MAX_MATCHES) return;
 					const full = join(dir, entry.name);
 					if (entry.isDirectory()) {
@@ -65,7 +70,10 @@ export function createGlobTool(cwd: string): AgentTool<typeof globSchema> {
 						const hit = nameRegex
 							? nameRegex.test(entry.name)
 							: pathRegex?.test(relative(root, full).split(sep).join("/"));
-						if (hit) matches.push(full);
+						if (hit) {
+							const info = await stat(full).catch(() => null);
+							matches.push({ file: full, size: info?.size });
+						}
 					}
 				}
 			};
@@ -76,8 +84,11 @@ export function createGlobTool(cwd: string): AgentTool<typeof globSchema> {
 			if (matches.length === 0) {
 				return { content: `No files matching pattern: ${pattern}`, details: { root } };
 			}
+			const body = matches
+				.map(({ file, size }) => (size === undefined ? file : `${file} (${size} bytes)`))
+				.join("\n");
 			const truncated = matches.length >= MAX_MATCHES ? `\n\n[Truncated: more than ${MAX_MATCHES} matches; narrow the pattern or path]` : "";
-			return { content: `${matches.join("\n")}${truncated}`, details: { root, matches: matches.length } };
+			return { content: `${body}${truncated}`, details: { root, matches: matches.length } };
 		},
 	};
 }

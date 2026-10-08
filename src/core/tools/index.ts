@@ -10,7 +10,8 @@ import { createScanTool } from "./scan.ts";
 import { createWriteTool } from "./write.ts";
 
 export { applyPatchSchema, createApplyPatchTool, type ApplyPatchInput } from "./apply-patch.ts";
-export { bashSchema, createBashTool, type BashInput, type BashToolOptions } from "./bash.ts";
+export { askUserSchema, createAskUserTool, type AskUserInput, type AskUserOptions, type AskUserRequest } from "./ask.ts";
+export { bashSchema, createBashTool, doubleLoopVariables, type BashInput, type BashToolOptions } from "./bash.ts";
 export { subAgentSchema, createSubAgentTool, type SubAgentInput, type SubAgentToolOptions } from "./subagent.ts";
 export { editSchema, createEditTool, type EditInput } from "./edit.ts";
 export { createFetchTool, fetchSchema, type FetchInput } from "./fetch.ts";

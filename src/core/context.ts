@@ -1,5 +1,6 @@
 import { stream } from "../ai/index.ts";
 import { estimateTokens } from "../ai/utils.ts";
+import { TURN_CAP_MARKER } from "./agent-loop.ts";
 import type { AgentTool, AssistantMessage, Message, Model, UserMessage } from "./types.ts";
 
 /** Default context budget (tokens) before the transcript is compressed. */
@@ -258,6 +259,7 @@ async function generateSummary(
 	apiKey: string | undefined,
 	prompt: string,
 	signal: AbortSignal | undefined,
+	sessionId: string | undefined,
 ): Promise<string | null> {
 	const eventStream = await stream(
 		{ ...model, thinking: false },
@@ -265,7 +267,7 @@ async function generateSummary(
 			messages: [{ role: "user", content: prompt, timestamp: Date.now() } satisfies UserMessage],
 			tools: [],
 		},
-		{ apiKey, maxTokens: SUMMARY_MAX_TOKENS, signal },
+		{ apiKey, maxTokens: SUMMARY_MAX_TOKENS, sessionId, signal },
 	);
 	let text = "";
 	for await (const event of eventStream) {
@@ -277,6 +279,7 @@ async function generateSummary(
 export interface CompactOptions {
 	model: Model;
 	apiKey?: string;
+	sessionId?: string;
 	systemPrompt: string;
 	tools?: AgentTool[];
 	maxContextTokens?: number;
@@ -291,9 +294,24 @@ export interface CompactOptions {
  * move / relevant files), keeping the recent tail verbatim. The checkpoint is
  * persisted in place so later turns reuse a stable prefix (cache-friendly).
  *
+ * User messages are never summarized away: task requirements stay verbatim in
+ * the transcript (and therefore visible in the UI), only assistant and tool
+ * turns — where the token bulk lives — are folded into the summary.
+ *
  * Falls back to {@link compressTranscript} when the summary cannot be produced.
  * Returns `null` when the transcript already fits the budget.
  */
+export function extractKeptUserMessages(messages: Message[]): UserMessage[] {
+	const out: UserMessage[] = [];
+	for (const message of messages) {
+		if (!message || message.role !== "user" || typeof message.content !== "string") continue;
+		if (message.content.startsWith(CHECKPOINT_PREFIX)) continue;
+		if (message.content.trimStart().startsWith(TURN_CAP_MARKER)) continue;
+		out.push(message);
+	}
+	return out;
+}
+
 export async function compactTranscript(
 	messages: Message[],
 	options: CompactOptions,
@@ -343,7 +361,7 @@ export async function compactTranscript(
 		return fallback;
 	}
 
-	const summary = await generateSummary(options.model, options.apiKey, summaryPrompt, options.signal);
+	const summary = await generateSummary(options.model, options.apiKey, summaryPrompt, options.signal, options.sessionId);
 	if (!summary) {
 		const fallback = compressTranscript(source, budget);
 		if (fallback) messages.splice(0, messages.length, ...fallback);
@@ -351,7 +369,7 @@ export async function compactTranscript(
 	}
 
 	const recentText = recent.map(serializeMessage).filter(Boolean).join("\n\n");
-	const compacted: Message[] = [makeCheckpointMessage(summary, recentText)];
+	const compacted: Message[] = [makeCheckpointMessage(summary, recentText), ...extractKeptUserMessages(headWithoutCheckpoint)];
 	messages.splice(0, messages.length, ...compacted);
 	return messages;
 }

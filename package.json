@@ -1,6 +1,6 @@
 {
 	"name": "tju-code",
-	"version": "0.1.14",
+	"version": "0.1.15",
 	"private": true,
 	"description": "A coding agent framework with a terminal CLI and an in-browser GUI, inspired by the pi agent harness architecture.",
 	"type": "module",

@@ -31,6 +31,14 @@ export interface AgentProviderState {
 	model: Model;
 	apiKey?: string;
 	entryId?: string;
+	/**
+	 * Stable id of the current conversation (usually the work item id).
+	 * Adapters send it as a session-affinity header on endpoints that
+	 * require one (e.g. OpenCode Go's `x-opencode-session`); it is routing
+	 * metadata, not part of the interface identity, so switching models or
+	 * keys never resets it — only switching conversations does.
+	 */
+	sessionId?: string;
 }
 
 export interface TextContent {
@@ -191,6 +199,12 @@ export interface BeforeToolCallResult {
 	reason?: string;
 }
 
+/** Gate run before a tool executes; `signal` aborts any prompt it raises. */
+export type BeforeToolCall = (
+	context: BeforeToolCallContext,
+	signal?: AbortSignal,
+) => Promise<BeforeToolCallResult | undefined>;
+
 export interface AfterToolCallContext {
 	tool: AgentTool;
 	args: unknown;
@@ -214,6 +228,8 @@ export interface AgentLoopConfig {
 	apiKey?: string;
 	maxTokens?: number;
 	temperature?: number;
+	/** Stable per-conversation id forwarded to the provider adapter. */
+	sessionId?: string;
 	/**
 	 * Optional context transform before the provider call. Use this for
 	 * workspace pruning, summarization, atomic injection of project context, etc.
@@ -228,7 +244,7 @@ export interface AgentLoopConfig {
 		options?: { force?: boolean },
 	) => Promise<AgentMessage[] | null>;
 	/** Called before a tool executes (after validation). Return { block: true } to prevent execution. */
-	beforeToolCall?: (context: BeforeToolCallContext, signal?: AbortSignal) => Promise<BeforeToolCallResult | undefined>;
+	beforeToolCall?: BeforeToolCall;
 	/** Called after a tool finishes to transform its result before it is returned to the model. */
 	afterToolCall?: (context: AfterToolCallContext, signal?: AbortSignal) => Promise<AgentToolResult | undefined>;
 	/**

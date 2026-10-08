@@ -2,7 +2,7 @@ import type { AssistantMessage, Message, Usage } from "../core/types.ts";
 import { isDeepSeekProvider, normalizeReasoningEffort, type ReasoningEffort } from "../core/reasoning-effort.ts";
 import { EventStream } from "../core/event-stream.ts";
 import { readSse } from "./sse.ts";
-import { estimateTokens, fetchWithRetry, HttpError, parseJsonArguments, sanitizeMessages } from "./utils.ts";
+import { affinityHeaders, estimateTokens, fetchWithRetry, HttpError, parseJsonArguments, sanitizeMessages } from "./utils.ts";
 import type { Context, GroundEvent, ProviderAdapter, ProviderStreamOptions } from "./types.ts";
 
 type AnthropicStreamEvent =
@@ -215,6 +215,7 @@ async function runStream(
 					"content-type": "application/json",
 					"x-api-key": apiKey,
 					"anthropic-version": "2023-06-01",
+					...affinityHeaders(baseUrl, options?.sessionId),
 				},
 				body: JSON.stringify(body),
 				signal: options?.signal,

@@ -1,7 +1,7 @@
 import { accessSync, constants, existsSync, mkdirSync, openSync, renameSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { platform, tmpdir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve, sep } from "node:path";
 import { spawn } from "node:child_process";
 
 export interface UpdateFile {
@@ -59,8 +59,26 @@ export function normalizeBaseUrl(baseUrl: string): string {
 	return baseUrl.replace(/\/+$/, "");
 }
 
+/**
+ * Update sources must be https: the manifest is fetched from the same origin as
+ * the payload and carries the sha256 values used to verify it, so integrity
+ * rests entirely on transport security. Over plain http anyone on the path can
+ * ship arbitrary code that passes the checks made from their own manifest.
+ */
+function assertSecureUpdateUrl(baseUrl: string): void {
+	let parsed: URL;
+	try {
+		parsed = new URL(baseUrl);
+	} catch {
+		fail(`更新源地址非法：${baseUrl}`);
+	}
+	if (parsed.protocol !== "https:") {
+		fail(`更新源必须使用 https（当前：${parsed.protocol}//）；如需从本地目录调试，请显式改用 TJU_CODE_INSECURE_UPDATE=1`);
+	}
+}
+
 async function fetchBuffer(url: string): Promise<Buffer> {
-	const res = await fetch(url, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
+	const res = await fetch(url, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS), redirect: "follow" });
 	if (!res.ok) fail(`下载失败 HTTP ${res.status}：${url}`);
 	return Buffer.from(await res.arrayBuffer());
 }
@@ -90,6 +108,7 @@ function checkManifestShape(value: unknown): asserts value is UpdateManifest {
 }
 
 export async function fetchManifest(baseUrl: string): Promise<UpdateManifest> {
+	if (process.env.TJU_CODE_INSECURE_UPDATE !== "1") assertSecureUpdateUrl(baseUrl);
 	let value: unknown;
 	try {
 		const res = await fetch(`${normalizeBaseUrl(baseUrl)}/latest.json`, {
@@ -141,7 +160,18 @@ function sha256Hex(buf: Buffer): string {
 }
 
 function safeJoin(stagingDir: string, rel: string): string {
-	return join(stagingDir, ...rel.split("/"));
+	const dest = join(stagingDir, ...rel.split("/"));
+	// The manifest is the only place a file path comes from, and it is checked by
+	// checkManifestShape — but this is the function that actually turns a
+	// manifest string into a write target, so it enforces the boundary itself
+	// instead of relying on its callers. On Windows a mid-path drive letter
+	// (`C:/x`) would otherwise produce a path whose parent does not exist.
+	const root = resolve(stagingDir);
+	const target = resolve(dest);
+	if (target !== root && !target.startsWith(root + sep)) {
+		fail(`更新包文件路径越界，已拒绝：${rel}`);
+	}
+	return dest;
 }
 
 export async function stageRelease(baseUrl: string, manifest: UpdateManifest, stagingDir: string): Promise<void> {
@@ -240,11 +270,38 @@ export async function swapRollback(root: string): Promise<void> {
 	}
 }
 
-function escapeCmdArg(a: string): string {
-	if (/[ \t"]/.test(a)) return a;
-	return a.replace(/([&<>()@^|%!])/g, "^$1");
+/**
+ * Environment variable carrying the relaunch argument vector as JSON.
+ *
+ * The arguments (`--api-key`, `--base-url`, …) can contain spaces, quotes, `&`,
+ * `|`, `%VAR%` — none of which can be made safe on a cmd.exe command line,
+ * because cmd parses the line after Node has already flattened argv into it.
+ * Passing them in the environment sidesteps the command-line parser entirely:
+ * only two trusted absolute paths (this executable and `dist/cli.js`) remain on
+ * the line. The old `escapeCmdArg` could not be repaired for this: it returned
+ * arguments containing a space or quote unescaped, so `--api-key "a b" & calc`
+ * ran two commands.
+ */
+export const RELAUNCH_ARGV_ENV = "TJU_CODE_RELAUNCH_ARGV";
+
+/**
+ * Argument vector for the Windows relaunch (`cmd.exe /d /s /c start ...`).
+ * Paths travel bare: Node's spawn quotes arguments containing spaces exactly
+ * once, while pre-quoting here would make it quote a second time (inner quotes
+ * become backslash-escapes cmd.exe does not understand), so `C:\Program Files\…`
+ * would be split at the space and fail with "找不到文件 'C:\Program'".
+ */
+export function buildWindowsRelaunchArgs(exe: string, cli: string): string[] {
+	return ["/d", "/s", "/c", "start", "Tju code", exe, cli];
 }
 
+/**
+ * Relaunch the given command line in a new terminal window.
+ *
+ * The Windows branch goes through cmd.exe's `start` so the new process gets its
+ * own console window; everything user-controlled travels in
+ * {@link RELAUNCH_ARGV_ENV} instead of on the command line.
+ */
 export function relaunch(root: string, args: string[]): void {
 	const stamp = new Date().toISOString();
 	const logLine = (s: string): void => {
@@ -254,18 +311,30 @@ export function relaunch(root: string, args: string[]): void {
 			// ignore logging failures
 		}
 	};
-	const target = [process.execPath, join(root, "dist", "cli.js"), ...args];
+	const exe = process.execPath;
+	const cli = join(root, "dist", "cli.js");
+	const target = [exe, cli, ...args];
+	if (exe.includes('"') || cli.includes('"')) {
+		const message = `安装路径含双引号，无法安全重启，请手动再启动一次：${root}`;
+		logLine(message);
+		throw new Error(message);
+	}
+	const env = { ...process.env, [RELAUNCH_ARGV_ENV]: JSON.stringify(args) };
 	let child: ReturnType<typeof spawn>;
 	try {
 		if (platform() === "win32") {
-			child = spawn("cmd.exe", ["/d", "/s", "/c", "start", "Tju code", ...target.map(escapeCmdArg)], {
+			// `start` needs a title argument, else it treats the first quoted token as
+			// the title and drops it. Only the two quoted trusted paths follow it.
+			child = spawn("cmd.exe", buildWindowsRelaunchArgs(exe, cli), {
 				detached: true,
 				stdio: "ignore",
+				env,
 			});
 		} else {
-			child = spawn(target[0] ?? process.execPath, target.slice(1), {
+			child = spawn(exe, target.slice(1), {
 				detached: true,
 				stdio: "ignore",
+				env,
 			});
 		}
 	} catch (err) {
@@ -277,6 +346,24 @@ export function relaunch(root: string, args: string[]): void {
 		logLine(`child error: ${err instanceof Error ? err.message : String(err)}`);
 	});
 	child.unref();
+}
+
+/**
+ * The argument vector a relaunch asked for, if this process was started by one.
+ * Consumed (and removed from the environment) on first read so a grandchild
+ * relaunch cannot inherit a stale vector.
+ */
+export function takeRelaunchArgs(): string[] | null {
+	const raw = process.env[RELAUNCH_ARGV_ENV];
+	delete process.env[RELAUNCH_ARGV_ENV];
+	if (!raw) return null;
+	try {
+		const parsed = JSON.parse(raw) as unknown;
+		if (!Array.isArray(parsed)) return null;
+		return parsed.filter((a): a is string => typeof a === "string");
+	} catch {
+		return null;
+	}
 }
 
 export function stagingDirFor(root: string): string {

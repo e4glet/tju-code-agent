@@ -3,6 +3,7 @@ import { applyLauncherConfig as applyLauncherConfigToStore, launcherFallbackId, 
 import { DATA_DIR_ENV, resolveDataRoot } from "./data-root.ts";
 import { runChat } from "./cli/chat.ts";
 import { startGuiServer } from "./gui/server.ts";
+import { takeRelaunchArgs } from "./update.ts";
 import { APP_NAME, APP_VERSION, printBanner } from "./cli/banner.ts";
 
 export function parseArgs(argv: string[]): { command: string; flags: CliFlags } {
@@ -63,7 +64,11 @@ export function parseArgs(argv: string[]): { command: string; flags: CliFlags } 
 }
 
 async function main(): Promise<void> {
-	const args = process.argv.slice(2);
+	// A self-update relaunch hands the original flags over in the environment
+	// rather than on the command line, which cannot carry them safely (see
+	// `relaunch` in update.ts). Process.argv wins so explicit flags still work.
+	const inherited = takeRelaunchArgs() ?? [];
+	const args = process.argv.length > 2 ? process.argv.slice(2) : inherited;
 	const { command, flags } = parseArgs(args);
 	const dataDir = flags["data-dir"];
 	if (typeof dataDir === "string" && dataDir) process.env[DATA_DIR_ENV] = dataDir;
@@ -125,6 +130,7 @@ function applyLauncherConfig(flags: CliFlags): void {
 			delete flags["model"];
 			delete flags.api;
 			delete flags.provider;
+			flags.launcherProfileStale = true;
 		} else if (result.status === "error") {
 			console.error(`[warn] 启动脚本接口导入失败：${result.error}（本次按脚本参数运行）`);
 		}
@@ -137,6 +143,7 @@ function applyLauncherConfig(flags: CliFlags): void {
 		const fallback = launcherFallbackId();
 		if (fallback && loadProviderTable(PROVIDER_ENTRIES).table[fallback]) {
 			flags.profile = fallback;
+			flags.launcherProfileStale = true;
 		}
 	}
 }
@@ -179,7 +186,7 @@ Flags:
 
 Environment:
   OPENAI_API_KEY / OPENAI_BASE_URL / ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL
-  DEEPSEEK_API_KEY / MOONSHOT_API_KEY / DASHSCOPE_API_KEY
+  DEEPSEEK_API_KEY / MOONSHOT_API_KEY / DASHSCOPE_API_KEY / OPENCODE_GO_API_KEY
 `);
 }
 

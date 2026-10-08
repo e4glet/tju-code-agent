@@ -2,6 +2,7 @@ import { Agent } from "./core/agent.ts";
 import type { AgentOptions } from "./core/agent.ts";
 import type { AfterToolCallContext, AgentTool, AgentToolResult, Attachment, TodoStore } from "./core/types.ts";
 import { createAllTools } from "./core/tools/index.ts";
+import { createAskUserTool, type AskUserRequest } from "./core/tools/ask.ts";
 import { createTodoTool } from "./core/tools/todo.ts";
 import { createSubAgentTool } from "./core/tools/subagent.ts";
 import { DEFAULT_SYSTEM_PROMPT, modelFromConfig, type RunConfig } from "./config.ts";
@@ -15,6 +16,12 @@ export interface CreateAgentOptions extends Pick<AgentOptions, "beforeToolCall" 
 	todoStore?: TodoStore;
 	/** Resolver that turns a user-message attachment reference into its bytes. */
 	resolveAttachment?: (attachment: Attachment) => Promise<Uint8Array | null>;
+	/**
+	 * Handler for ask_user questions. Absent in contexts without a user
+	 * (tests, headless runs): the tool then tells the model to proceed with
+	 * its best judgment instead of hanging.
+	 */
+	askUser?: (request: AskUserRequest, signal?: AbortSignal) => Promise<string>;
 }
 
 const SECURITY_HINT_TOOLS = new Set(["write", "edit"]);
@@ -38,33 +45,65 @@ function securityHintAfterToolCall(
 export function createAgent(options: CreateAgentOptions): Agent {
 	const { config, cwd } = options;
 	const todoStore: TodoStore = options.todoStore ?? { todos: [] };
-	const tools = options.tools ?? createAllTools(cwd);
-	const afterToolCall = securityHintAfterToolCall(options.afterToolCall);
 	const agentModel = modelFromConfig(config);
 	const agent = new Agent({
 		model: agentModel,
 		systemPrompt: options.systemPrompt ?? DEFAULT_SYSTEM_PROMPT,
-		tools: [...tools, createTodoTool(todoStore) as unknown as AgentTool],
+		tools: [],
 		apiKey: config.apiKey,
 		provider: { model: agentModel, apiKey: config.apiKey, entryId: config.providerEntryId },
 		maxTokens: config.maxTokens,
 		maxContextTokens: config.maxContextTokens,
 		maxTurns: config.maxTurns,
 		beforeToolCall: options.beforeToolCall,
-		afterToolCall,
+		afterToolCall: securityHintAfterToolCall(options.afterToolCall),
 		todoStore,
 		resolveAttachment: options.resolveAttachment,
 	});
-	agent.setTools([
-		...agent.state.tools,
-		createSubAgentTool({
+	agent.setTools(
+		buildAgentTools(agent, {
 			cwd,
-			provider: agent.provider,
 			maxTokens: config.maxTokens,
-			tools,
+			tools: options.tools,
+			todoStore,
 			beforeToolCall: options.beforeToolCall,
+			afterToolCall: options.afterToolCall,
+			askUser: options.askUser,
+		}),
+	);
+	return agent;
+}
+
+export interface AgentToolchainDeps {
+	cwd: string;
+	maxTokens?: number;
+	tools?: AgentTool[];
+	todoStore: TodoStore;
+	beforeToolCall?: AgentOptions["beforeToolCall"];
+	afterToolCall?: AgentOptions["afterToolCall"];
+	askUser?: (request: AskUserRequest, signal?: AbortSignal) => Promise<string>;
+}
+
+export function buildAgentTools(agent: Agent, deps: AgentToolchainDeps): AgentTool[] {
+	const base = deps.tools ?? createAllTools(deps.cwd);
+	const afterToolCall = securityHintAfterToolCall(deps.afterToolCall);
+	return [
+		...base,
+		createTodoTool(deps.todoStore) as unknown as AgentTool,
+		createSubAgentTool({
+			cwd: deps.cwd,
+			provider: agent.provider,
+			maxTokens: deps.maxTokens,
+			tools: base,
+			beforeToolCall: deps.beforeToolCall,
 			afterToolCall,
 		}) as unknown as AgentTool,
-	]);
-	return agent;
+		createAskUserTool({
+			canAsk: () => agent.consumeAskSlot(),
+			releaseAskSlot: () => agent.releaseAskSlot(),
+			ask: deps.askUser ?? (async () => {
+				throw new Error("no user to ask");
+			}),
+		}) as unknown as AgentTool,
+	];
 }

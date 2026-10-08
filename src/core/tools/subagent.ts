@@ -74,6 +74,7 @@ export function createSubAgentTool(options: SubAgentToolOptions): AgentTool<type
 			const subConfig: AgentLoopConfig = {
 				model: options.provider.model,
 				apiKey: options.provider.apiKey,
+				sessionId: options.provider.sessionId,
 				maxTokens: options.maxTokens,
 				temperature: options.temperature,
 				systemPrompt: subSystemPrompt,

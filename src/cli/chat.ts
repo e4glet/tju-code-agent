@@ -161,11 +161,13 @@ export async function runChat(config: RunConfig, cwd: string): Promise<void> {
 	const rl = createInterface({ input, output });
 	const approval = createApprovalGate({
 		workdir: cwd,
-		ask: async (request) => {
+		ask: async (request, signal) => {
 			for (;;) {
+				if (signal?.aborted) return false;
 				const answer = (
 					await rl.question(
 						`\n\u001b[33m[权限]\u001b[0m 工具 ${request.toolName} 将访问工作目录外的目录：\n  ${request.scopeDir}\n允许? (y/n) > `,
+						{ signal },
 					)
 				)
 					.trim()
@@ -178,7 +180,29 @@ export async function runChat(config: RunConfig, cwd: string): Promise<void> {
 	const sessionDir = config.sessionDir ?? join(resolveDataRoot(), "works");
 	const sessionStore = new SessionStore({ dir: sessionDir });
 	const workTodos: TodoStore = { todos: [] };
-	const agent = createAgent({ config, cwd, todoStore: workTodos, beforeToolCall: approval });
+	const agent = createAgent({
+		config,
+		cwd,
+		todoStore: workTodos,
+		beforeToolCall: approval,
+		askUser: async (request, signal) => {
+			write(`\n\u001b[33m[提问]\u001b[0m ${request.question}\n`);
+			request.options.forEach((opt, i) => write(`  ${i + 1}. ${opt}\n`));
+			for (;;) {
+				// `signal` is what makes Ctrl+C work here: agent.abort() aborts the
+				// run, readline rejects with AbortError and the caller reports the
+				// question as cancelled instead of leaving the user at a dead prompt.
+				if (signal?.aborted) throw new Error("Question cancelled");
+				const answer = (await rl.question(`输入序号选择，或直接输入回答 > `, { signal })).trim();
+				if (!answer) continue;
+				const pick = Number(answer);
+				if (Number.isInteger(pick) && pick >= 1 && pick <= request.options.length) {
+					return request.options[pick - 1] as string;
+				}
+				return answer;
+			}
+		},
+	});
 	const unsubscribe = subscribeRenderer(agent);
 
 	let interrupted = false;
@@ -191,6 +215,10 @@ export async function runChat(config: RunConfig, cwd: string): Promise<void> {
 	rl.on("SIGINT", onSigInt);
 
 	let currentWorkId: string | null = null;
+	const trackWork = (id: string): void => {
+		currentWorkId = id;
+		agent.provider.sessionId = id;
+	};
 	const saveCurrentWork = async (): Promise<void> => {
 		if (!currentWorkId) return;
 		const state = agent.state;
@@ -216,7 +244,7 @@ export async function runChat(config: RunConfig, cwd: string): Promise<void> {
 		await saveCurrentWork();
 		workTodos.todos = item.todos.slice();
 		agent.restore({ messages: item.messages, todos: item.todos });
-		currentWorkId = id;
+		trackWork(id);
 		await sessionStore.setLastActive(id);
 		write(`opened work item: ${item.title} (${item.messages.length} messages, ${item.todos.length} todos)\n`);
 	};
@@ -237,7 +265,7 @@ export async function runChat(config: RunConfig, cwd: string): Promise<void> {
 		if (event.type === "agent_end") {
 			try {
 				if (!currentWorkId && agent.state.messages.length) {
-					currentWorkId = `${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+					trackWork(`${Date.now()}-${Math.random().toString(16).slice(2, 8)}`);
 				}
 				await saveCurrentWork();
 			} catch {
@@ -257,10 +285,10 @@ export async function runChat(config: RunConfig, cwd: string): Promise<void> {
 		if (item) {
 			workTodos.todos = item.todos.slice();
 			agent.restore({ messages: item.messages, todos: item.todos });
-			currentWorkId = item.id;
+			trackWork(item.id);
 			write(`resumed work item: ${item.title} (${item.messages.length} messages, ${item.todos.length} todos)\n`);
 		} else {
-			currentWorkId = `${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+			trackWork(`${Date.now()}-${Math.random().toString(16).slice(2, 8)}`);
 			await saveCurrentWork();
 			write(`created new work item: ${currentWorkId}\n`);
 		}
@@ -316,7 +344,7 @@ export async function runChat(config: RunConfig, cwd: string): Promise<void> {
 								break;
 							}
 							await saveCurrentWork();
-							currentWorkId = `${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+							trackWork(`${Date.now()}-${Math.random().toString(16).slice(2, 8)}`);
 							await agent.waitForIdle();
 							agent.resetTranscript();
 							workTodos.todos = [];

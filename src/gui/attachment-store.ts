@@ -16,6 +16,7 @@ import type { Attachment, AttachmentKind } from "../core/types.ts";
  */
 export class AttachmentStore {
 	readonly root: string;
+	private readonly saveLocks = new Map<string, Promise<void>>();
 
 	constructor(root: string) {
 		this.root = root;
@@ -55,20 +56,32 @@ export class AttachmentStore {
 		meta: { name: string; mime: string; kind: AttachmentKind },
 		bytes: Uint8Array,
 	): Promise<Attachment> {
-		const id = randomBytes(12).toString("hex");
-		const attachment: Attachment = {
-			id,
-			name: meta.name || "attachment",
-			mime: meta.mime || "application/octet-stream",
-			size: bytes.byteLength,
-			kind: meta.kind,
-		};
-		await mkdir(this.workDir(workId), { recursive: true });
-		await writeFile(this.filePath(workId, id), bytes);
-		const index = await this.loadIndex(workId);
-		index[id] = attachment;
-		await this.saveIndex(workId, index);
-		return attachment;
+		const prev = this.saveLocks.get(workId) ?? Promise.resolve();
+		let release!: () => void;
+		const cur = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		this.saveLocks.set(workId, cur);
+		await prev;
+		try {
+			const id = randomBytes(12).toString("hex");
+			const attachment: Attachment = {
+				id,
+				name: meta.name || "attachment",
+				mime: meta.mime || "application/octet-stream",
+				size: bytes.byteLength,
+				kind: meta.kind,
+			};
+			await mkdir(this.workDir(workId), { recursive: true });
+			await writeFile(this.filePath(workId, id), bytes);
+			const index = await this.loadIndex(workId);
+			index[id] = attachment;
+			await this.saveIndex(workId, index);
+			return attachment;
+		} finally {
+			if (this.saveLocks.get(workId) === cur) this.saveLocks.delete(workId);
+			release();
+		}
 	}
 
 	/** Read a stored attachment's bytes by id (null when missing). */

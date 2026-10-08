@@ -1,6 +1,7 @@
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
+import { affinityHeaders } from "./ai/utils.ts";
 import { resolveDataRoot } from "./data-root.ts";
 import type { ProviderEntry, ProviderModel } from "./config.ts";
 import type { ApiKind } from "./core/types.ts";
@@ -661,7 +662,10 @@ export async function probeModels(
 }
 
 async function pingChat(api: ApiKind, base: string, model: string, apiKey: string): Promise<ProbeResult> {
-	const pingHeaders: Record<string, string> = { "content-type": "application/json" };
+	const pingHeaders: Record<string, string> = {
+		"content-type": "application/json",
+		...affinityHeaders(base, `probe-${randomUUID()}`),
+	};
 	let url: string;
 	let body: unknown;
 	if (api === "anthropic-messages") {

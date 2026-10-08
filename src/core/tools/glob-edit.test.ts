@@ -68,6 +68,12 @@ describe("glob tool", () => {
 		expect(res.content).toContain("a.ts");
 		expect(res.content).not.toContain("b.ts");
 	});
+	it("reports each match with its size in bytes", async () => {
+		const root = freshDir();
+		seedTree(root);
+		const res = await run(createGlobTool(root), { pattern: "README.md" });
+		expect(res.content).toContain(`README.md (5 bytes)`);
+	});
 	it("reports no matches instead of erroring", async () => {
 		const root = freshDir();
 		seedTree(root);
@@ -185,5 +191,24 @@ describe("glob permission gate", () => {
 			args: { pattern: "*.ts" },
 		});
 		expect(inside).toBeUndefined();
+	});
+
+	it("asks for an out-of-workdir bash workdir", async () => {
+		const work = freshDir();
+		const outside = freshDir();
+		const seen: string[] = [];
+		const gate = createApprovalGate({
+			workdir: work,
+			ask: async (request) => {
+				seen.push(request.scopeDir);
+				return false;
+			},
+		});
+		const blocked = await gate({
+			toolCall: { type: "toolCall", id: "t1", name: "bash", arguments: {} },
+			args: { command: "echo hi", workdir: outside },
+		});
+		expect(blocked?.block).toBe(true);
+		expect(seen.length).toBe(1);
 	});
 });

@@ -1,4 +1,22 @@
 import type { AssistantMessage, Message } from "../core/types.ts";
+import { APP_VERSION } from "../version.ts";
+
+const OPENCODE_HOST_RE = /(^|\.)opencode\.ai$/i;
+
+function isOpencodeEndpoint(baseUrl: string | undefined): boolean {
+	if (!baseUrl) return false;
+	try {
+		return OPENCODE_HOST_RE.test(new URL(baseUrl).hostname);
+	} catch {
+		return baseUrl.toLowerCase().includes("opencode.ai");
+	}
+}
+
+export function affinityHeaders(baseUrl: string | undefined, sessionId: string | undefined): Record<string, string> {
+	const headers: Record<string, string> = { "user-agent": `tju-code/${APP_VERSION}` };
+	if (sessionId && isOpencodeEndpoint(baseUrl)) headers["x-opencode-session"] = sessionId;
+	return headers;
+}
 
 /**
  * Repair an outbound transcript so every assistant turn is a shape the chat
@@ -115,6 +133,25 @@ function backoffMs(attempt: number): number {
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
+function sleepAbortable(ms: number, signal?: AbortSignal | null): Promise<void> {
+	return new Promise((resolve, reject) => {
+		if (signal?.aborted) {
+			reject(new DOMException("Aborted", "AbortError"));
+			return;
+		}
+		const timer = setTimeout(() => {
+			signal?.removeEventListener("abort", onAbort);
+			resolve();
+		}, ms);
+		const onAbort = (): void => {
+			clearTimeout(timer);
+			signal?.removeEventListener("abort", onAbort);
+			reject(new DOMException("Aborted", "AbortError"));
+		};
+		signal?.addEventListener("abort", onAbort, { once: true });
+	});
+}
+
 /**
  * fetch with exponential backoff for transient failures: network errors and
  * retryable HTTP statuses (5xx, 429, 408). Config errors (400/401/403) and
@@ -141,7 +178,7 @@ export async function fetchWithRetry(
 			if (init.signal?.aborted) throw error;
 			if (attempt === retries) throw error;
 		}
-		await sleep(backoffMs(attempt));
+		await sleepAbortable(backoffMs(attempt), init.signal);
 	}
 	return lastResponse as Response;
 }

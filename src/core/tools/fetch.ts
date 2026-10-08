@@ -1,6 +1,8 @@
 import { lookup } from "node:dns/promises";
 import { z } from "zod";
+import { isLoopbackHost } from "../permission.ts";
 import type { AgentTool } from "../types.ts";
+import { APP_VERSION } from "../../version.ts";
 
 const DEFAULT_MAX_BYTES = 1024 * 1024;
 const DEFAULT_TIMEOUT_SECONDS = 30;
@@ -24,12 +26,27 @@ export const fetchSchema = z.object({
 		.boolean()
 		.optional()
 		.describe(
-			"Allow requests to private/loopback/link-local addresses (disabled by default for SSRF safety). " +
+			"Allow requests to private/link-local addresses (disabled by default for SSRF safety). " +
+				"Loopback targets are never allowed through this tool; use bash instead. " +
 				"Only set true when the target is a local or internal service you intend to reach.",
 		),
 });
 
 export type FetchInput = z.infer<typeof fetchSchema>;
+
+function errorCauseChain(error: unknown): string {
+	const parts: string[] = [];
+	let current = error;
+	for (let i = 0; i < 3 && current instanceof Error; i++) {
+		if (current.message && !parts.includes(current.message)) parts.push(current.message);
+		current = (current as { cause?: unknown }).cause;
+	}
+	return parts.length > 0 ? parts.join(" <- ") : String(error);
+}
+
+export function describeFetchError(url: string, error: unknown): string {
+	return `Failed to fetch ${url}: ${errorCauseChain(error)}`;
+}
 
 function looksText(buffer: Uint8Array): boolean {
 	for (let i = 0; i < Math.min(buffer.length, 4096); i++) {
@@ -87,29 +104,100 @@ function looksLikeHtml(contentType: string, text: string): boolean {
 	return head.startsWith("<!doctype html") || head.startsWith("<html");
 }
 
+/** Parse a dotted-quad into its four octets (null when it is not one). */
+function parseIpv4(addr: string): number[] | null {
+	const parts = addr.split(".");
+	if (parts.length !== 4) return null;
+	const octets: number[] = [];
+	for (const part of parts) {
+		if (!/^\d{1,3}$/.test(part)) return null;
+		const value = Number(part);
+		if (value > 255) return null;
+		octets.push(value);
+	}
+	return octets;
+}
+
+/**
+ * Expand an IPv6 literal into its eight 16-bit groups (null when unparseable).
+ * Parsing structurally matters: the previous string-prefix check treated
+ * `::ffff:7f00:1` (the hex spelling of 127.0.0.1) and `::ffff:a9fe:a9fe`
+ * (169.254.169.254) as public, so any resolver that returned those forms would
+ * have walked straight past the guard.
+ */
+function parseIpv6(addr: string): number[] | null {
+	let text = addr.trim().toLowerCase();
+	const zone = text.indexOf("%");
+	if (zone !== -1) text = text.slice(0, zone); // strip scope id (fe80::1%eth0)
+	if (text.includes(".")) {
+		// A trailing dotted-quad (::ffff:1.2.3.4) becomes two groups.
+		const lastColon = text.lastIndexOf(":");
+		const tail = parseIpv4(text.slice(lastColon + 1));
+		if (!tail) return null;
+		const high = ((tail[0] ?? 0) << 8) | (tail[1] ?? 0);
+		const low = ((tail[2] ?? 0) << 8) | (tail[3] ?? 0);
+		text = `${text.slice(0, lastColon + 1)}${high.toString(16)}:${low.toString(16)}`;
+	}
+	if ((text.match(/::/g) ?? []).length > 1) return null;
+	const hasGap = text.includes("::");
+	const [headText, tailText] = hasGap ? text.split("::") : [text, undefined];
+	const split = (part: string): number[] | null => {
+		if (!part) return [];
+		const groups: number[] = [];
+		for (const piece of part.split(":")) {
+			if (!/^[0-9a-f]{1,4}$/.test(piece)) return null;
+			groups.push(Number.parseInt(piece, 16));
+		}
+		return groups;
+	};
+	const head = split(headText ?? "");
+	const tail = hasGap ? split(tailText ?? "") : [];
+	if (!head || !tail) return null;
+	if (!hasGap) return head.length === 8 ? head : null;
+	const missing = 8 - head.length - tail.length;
+	if (missing < 0) return null;
+	return [...head, ...new Array<number>(missing).fill(0), ...tail];
+}
+
+/** True unless the address is a routable public one. */
 function isNonPublicIp(ip: string): boolean {
-	let addr = ip.trim();
-	// Normalize IPv4-mapped IPv6 (::ffff:1.2.3.4) back to IPv4.
-	if (addr.startsWith("::ffff:")) addr = addr.slice(7);
+	const addr = ip.trim().replace(/^\[|\]$/g, "");
+
 	if (addr.includes(":")) {
-		// IPv6: loopback, unspecified, link-local, unique-local, and IPv4-mapped.
-		return (
-			addr === "::1" ||
-			addr === "::" ||
-			addr.startsWith("fc") ||
-			addr.startsWith("fd") ||
-			addr.startsWith("fe8") ||
-			addr.startsWith("fe9") ||
-			addr.startsWith("fea") ||
-			addr.startsWith("feb") ||
-			addr.toLowerCase().startsWith("0:0:0:0:0:ffff:0")
-		);
+		const groups = parseIpv6(addr);
+		if (!groups || groups.length !== 8) return true; // unparseable: refuse
+		const bytes = groups.flatMap((g) => [(g >> 8) & 0xff, g & 0xff]);
+		if (bytes.every((b) => b === 0)) return true; // :: (unspecified)
+		if (bytes.slice(0, 15).every((b) => b === 0) && bytes[15] === 1) return true; // ::1 loopback
+
+		// Addresses that carry an embedded IPv4 in their low 32 bits — the
+		// IPv4-compatible `::a.b.c.d`, the IPv4-mapped `::ffff:a.b.c.d`, and the
+		// IPv4-translated `::ffff:0:a.b.c.d` that Node's URL/lookup path produces
+		// for mapped literals — are judged by that IPv4 address. Matching on the
+		// byte layout rather than a string prefix is what makes `::ffff:7f00:1`
+		// and `::ffff:0:7f00:1` resolve to 127.0.0.1 instead of slipping through.
+		const compatible = bytes.slice(0, 12).every((b) => b === 0);
+		const mapped = bytes.slice(0, 10).every((b) => b === 0) && bytes[10] === 0xff && bytes[11] === 0xff;
+		const translated = bytes.slice(0, 8).every((b) => b === 0) && bytes[8] === 0xff && bytes[9] === 0xff;
+		if (compatible || mapped || translated) {
+			return isNonPublicIp(bytes.slice(12).join("."));
+		}
+		// NAT64 well-known prefix 64:ff9b::/96 embeds an IPv4 address too.
+		if (bytes[0] === 0x00 && bytes[1] === 0x64 && bytes[2] === 0xff && bytes[3] === 0x9b && bytes.slice(4, 12).every((b) => b === 0)) {
+			return isNonPublicIp(bytes.slice(12).join("."));
+		}
+		const g0 = groups[0] ?? 0;
+		const g1 = groups[1] ?? 0;
+		if ((g0 & 0xfe00) === 0xfc00) return true; // fc00::/7 unique-local
+		if ((g0 & 0xffc0) === 0xfe80) return true; // fe80::/10 link-local
+		if ((g0 & 0xff00) === 0xff00) return true; // ff00::/8 multicast
+		if (g0 === 0x2001 && g1 === 0x0db8) return true; // 2001:db8::/32 documentation
+		return false;
 	}
-	const parts = addr.split(".").map((n) => Number(n));
-	if (parts.length !== 4 || parts.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) {
-		return true; // not a valid public IPv4 literal
-	}
-	const [a, b] = parts as [number, number, number, number];
+
+	const octets = parseIpv4(addr);
+	if (!octets) return true; // not a valid IPv4 literal
+	const [a, b] = octets as [number, number, number, number];
 	if (a === 0) return true; // "this network"
 	if (a === 10) return true; // RFC1918
 	if (a === 127) return true; // loopback
@@ -140,10 +228,48 @@ async function resolveAddresses(url: URL): Promise<string[]> {
  * RFC1918, CGNAT, etc.) unless explicitly enabled via `allowPrivate`. This
  * mitigates SSRF: a model steered by hostile web content cannot be tricked into
  * probing the local network or cloud metadata endpoints.
+ *
+ * Loopback is always refused, even with `allowPrivate`: the approval gate owns
+ * loopback decisions for bash, while this tool offers no consent path, so an
+ * override here would be a silent self-attack primitive against anything bound
+ * to localhost (including this GUI backend itself).
  */
+function isLoopbackAddress(addr: string): boolean {
+	const ip = addr.trim().replace(/^\[|\]$/g, "");
+	if (!ip.includes(":")) {
+		const octets = parseIpv4(ip);
+		return !!octets && octets[0] === 127;
+	}
+	const groups = parseIpv6(ip);
+	if (!groups || groups.length !== 8) return false;
+	const bytes = groups.flatMap((g) => [(g >> 8) & 0xff, g & 0xff]);
+	if (bytes.slice(0, 15).every((b) => b === 0) && bytes[15] === 1) return true;
+	const embedded =
+		bytes.slice(0, 12).every((b) => b === 0) ||
+		(bytes.slice(0, 10).every((b) => b === 0) && bytes[10] === 0xff && bytes[11] === 0xff) ||
+		(bytes.slice(0, 8).every((b) => b === 0) && bytes[8] === 0xff && bytes[9] === 0xff) ||
+		(bytes[0] === 0x00 && bytes[1] === 0x64 && bytes[2] === 0xff && bytes[3] === 0x9b && bytes.slice(4, 12).every((b) => b === 0));
+	if (embedded) return isLoopbackAddress(bytes.slice(12).join("."));
+	return false;
+}
+
 async function assertPublicTarget(url: URL, allowPrivate: boolean): Promise<void> {
-	if (allowPrivate) return;
+	if (isLoopbackHost(url.hostname)) {
+		throw new Error(
+			`Blocked request to loopback address (${url.hostname}) for SSRF safety. ` +
+				"Loopback targets are never fetchable through this tool; use bash instead.",
+		);
+	}
 	const addresses = await resolveAddresses(url);
+	for (const addr of addresses) {
+		if (isLoopbackAddress(addr)) {
+			throw new Error(
+				`Blocked request to loopback address (${addr}) for SSRF safety. ` +
+					"Loopback targets are never fetchable through this tool; use bash instead.",
+			);
+		}
+	}
+	if (allowPrivate) return;
 	for (const addr of addresses) {
 		if (isNonPublicIp(addr)) {
 			throw new Error(
@@ -152,6 +278,41 @@ async function assertPublicTarget(url: URL, allowPrivate: boolean): Promise<void
 			);
 		}
 	}
+}
+
+/**
+ * Fetch while validating every hop. A single check of the URL the model passed
+ * is not enough: `redirect: "follow"` lets the remote side bounce the request to
+ * 127.0.0.1 (or any intranet host) after the guard has already returned, which
+ * defeats the SSRF protection entirely. So redirects are followed manually and
+ * each hop is re-validated before it is requested.
+ */
+const MAX_REDIRECTS = 5;
+
+async function fetchPublic(
+	startUrl: string,
+	allowPrivate: boolean,
+	signal: AbortSignal,
+): Promise<Response> {
+	let current = startUrl;
+	for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
+		const url = new URL(current);
+		if (url.protocol !== "http:" && url.protocol !== "https:") {
+			throw new Error(`Unsupported protocol: ${url.protocol}`);
+		}
+		await assertPublicTarget(url, allowPrivate);
+		const response = await fetch(url, {
+			signal,
+			redirect: "manual",
+			headers: { "user-agent": `tju-code/${APP_VERSION}` },
+		});
+		const location = response.headers.get("location");
+		if (response.status < 300 || response.status >= 400 || !location) return response;
+		// Drain redirect bodies so the socket is released before the next hop.
+		await response.body?.cancel().catch(() => {});
+		current = new URL(location, url).toString();
+	}
+	throw new Error(`Too many redirects (more than ${MAX_REDIRECTS})`);
 }
 
 async function readLimited(response: Response, limit: number): Promise<Uint8Array> {
@@ -206,7 +367,6 @@ export function createFetchTool(): AgentTool<typeof fetchSchema> {
 			if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
 				throw new Error(`Unsupported protocol: ${parsed.protocol}`);
 			}
-			await assertPublicTarget(parsed, allowPrivate ?? false);
 
 			const limit = maxBytes ?? DEFAULT_MAX_BYTES;
 			const timeoutMs = (timeout ?? DEFAULT_TIMEOUT_SECONDS) * 1000;
@@ -221,11 +381,9 @@ export function createFetchTool(): AgentTool<typeof fetchSchema> {
 			timer.unref?.();
 
 			try {
-				const response = await fetch(url, {
-					signal: controller.signal,
-					redirect: "follow",
-					headers: { "user-agent": "tju-code/0.1.0" },
-				});
+				// fetchPublic re-validates the target on the initial URL and on
+				// every redirect hop (see there for why one check is not enough).
+				const response = await fetchPublic(url, allowPrivate ?? false, controller.signal);
 				if (!response.ok) {
 					throw new Error(`HTTP ${response.status} ${response.statusText} for ${url}`);
 				}
@@ -279,7 +437,8 @@ export function createFetchTool(): AgentTool<typeof fetchSchema> {
 				};
 			} catch (error) {
 				if (call.signal?.aborted) throw new Error("Fetch aborted");
-				throw error;
+				if (error instanceof Error && error.message.startsWith("HTTP ")) throw error;
+				throw new Error(describeFetchError(url, error));
 			} finally {
 				clearTimeout(timer);
 				call.signal?.removeEventListener("abort", onAbort);

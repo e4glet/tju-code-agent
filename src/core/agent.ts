@@ -61,6 +61,9 @@ export interface AgentState {
 
 export type AgentListener = (event: AgentEvent, signal?: AbortSignal) => Promise<void> | void;
 
+/** Per-run cap for ask_user questions; waiting for an answer never consumes turns. */
+const MAX_ASKS_PER_RUN = 1;
+
 /**
  * Stateful coding agent wrapping the low-level loop.
  *
@@ -83,6 +86,7 @@ export class Agent {
 	private temperature?: number;
 	private maxContextTokens?: number;
 	private maxTurns?: number;
+	private askCountThisRun = 0;
 	private beforeToolCall?: AgentOptions["beforeToolCall"];
 	private afterToolCall?: AgentOptions["afterToolCall"];
 	private afterTurn?: AgentLoopConfig["afterTurn"];
@@ -140,7 +144,36 @@ export class Agent {
 
 	/** Replace the tool set for subsequent turns. */
 	setTools(tools: AgentTool[]): void {
+		if (this.isStreaming) {
+			throw new Error("Cannot replace tools while streaming. Wait for the run to finish first.");
+		}
 		this.tools = tools.slice();
+	}
+
+	setBeforeToolCall(hook: AgentOptions["beforeToolCall"]): void {
+		if (this.isStreaming) {
+			throw new Error("Cannot replace the approval gate while streaming. Wait for the run to finish first.");
+		}
+		this.beforeToolCall = hook;
+	}
+
+	/**
+	 * Consume one per-run question slot for the ask_user tool (max 1 per run).
+	 * The waiting itself never consumes turns; only each actual question does.
+	 */
+	consumeAskSlot(): boolean {
+		if (this.askCountThisRun >= MAX_ASKS_PER_RUN) return false;
+		this.askCountThisRun++;
+		return true;
+	}
+
+	/**
+	 * Refund a slot consumed by {@link consumeAskSlot} when the question never
+	 * reached the user (cancelled ask). A failed ask must not burn the run's
+	 * single question.
+	 */
+	releaseAskSlot(): void {
+		this.askCountThisRun = Math.max(0, this.askCountThisRun - 1);
 	}
 
 	/** Subscribe to lifecycle events. Returns an unsubscribe function. */
@@ -185,6 +218,25 @@ export class Agent {
 	}
 
 	/**
+	 * Truncate the transcript at the message with the given timestamp,
+	 * removing it and everything after it. Only the conversation is rolled
+	 * back; files on disk are untouched. Only valid while idle.
+	 */
+	revertTo(timestamp: number): void {
+		if (this.isStreaming) {
+			throw new Error("Cannot revert while streaming. Wait for the run to finish first.");
+		}
+		const index = this.messages.findIndex((m) => m.timestamp === timestamp);
+		if (index < 0) {
+			throw new Error(`Unknown message timestamp: ${timestamp}`);
+		}
+		this.messages = this.messages.slice(0, index);
+		this.steeringQueue.length = 0;
+		this.errorMessage = undefined;
+		this.streamingMessage = undefined;
+	}
+
+	/**
 	 * Replace the transcript and todo list with a saved snapshot so a
 	 * previous conversation can be resumed without triggering a run. Only
 	 * valid while idle.
@@ -216,6 +268,7 @@ export class Agent {
 		if (this.isStreaming) {
 			throw new Error("Agent is already processing. Use steer() to queue a message, or wait for the run to finish.");
 		}
+		this.askCountThisRun = 0;
 		const prompts: Message[] = Array.isArray(input)
 			? input
 			: typeof input === "string"
@@ -246,6 +299,7 @@ export class Agent {
 		return {
 			model: this.provider.model,
 			apiKey: this.provider.apiKey,
+			sessionId: this.provider.sessionId,
 			maxTokens: this.maxTokens,
 			temperature: this.temperature,
 			systemPrompt: this.systemPrompt,
@@ -262,6 +316,7 @@ export class Agent {
 				const result = await compactTranscript(messages, {
 					model: this.provider.model,
 					apiKey: this.provider.apiKey,
+					sessionId: this.provider.sessionId,
 					systemPrompt: this.systemPrompt,
 					tools: this.tools,
 					maxContextTokens: this.maxContextTokens,

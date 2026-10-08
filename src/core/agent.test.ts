@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { Agent } from "./agent.ts";
-import type { Model } from "./types.ts";
+import type { Model, UserMessage } from "./types.ts";
 
 const BASE_MODEL: Model = { id: "m1", api: "openai-completions", provider: "openai" };
 
@@ -50,5 +50,23 @@ describe("Agent provider state", () => {
 	it("never leaks the key through the state snapshot", () => {
 		const agent = new Agent({ model: BASE_MODEL, apiKey: "secret" });
 		expect(JSON.stringify(agent.state)).not.toContain("secret");
+	});
+});
+
+describe("Agent revertTo", () => {
+	const um = (timestamp: number, content: string): UserMessage => ({ role: "user", content, timestamp });
+
+	it("drops the target message and everything after it", () => {
+		const agent = new Agent({ model: BASE_MODEL });
+		agent.restore({ messages: [um(1, "first"), um(2, "second"), um(3, "third")] });
+		agent.revertTo(2);
+		expect(agent.state.messages.map((m) => (m as UserMessage).content)).toEqual(["first"]);
+	});
+
+	it("rejects an unknown timestamp without touching the transcript", () => {
+		const agent = new Agent({ model: BASE_MODEL });
+		agent.restore({ messages: [um(1, "first")] });
+		expect(() => agent.revertTo(99)).toThrow("Unknown message timestamp");
+		expect(agent.state.messages).toHaveLength(1);
 	});
 });

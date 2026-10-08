@@ -59,9 +59,10 @@ function resolveScanRoot(cwd: string, input?: string): string {
 	return isAbsolute(input) ? input : resolve(cwd, input);
 }
 
-async function collectSecrets(root: string): Promise<SecretFinding[]> {
+async function collectSecrets(root: string, signal?: AbortSignal): Promise<SecretFinding[]> {
 	const findings: SecretFinding[] = [];
 	const scanFile = async (file: string): Promise<void> => {
+		if (signal?.aborted) throw new Error("Scan aborted");
 		if (findings.length >= MAX_FINDINGS) return;
 		const info = await stat(file).catch(() => null);
 		if (!info?.isFile() || info.size > MAX_SCAN_BYTES) return;
@@ -81,6 +82,7 @@ async function collectSecrets(root: string): Promise<SecretFinding[]> {
 		}
 	};
 	const walk = async (dir: string): Promise<void> => {
+		if (signal?.aborted) throw new Error("Scan aborted");
 		let entries;
 		try {
 			entries = await readdir(dir, { withFileTypes: true });
@@ -188,7 +190,7 @@ function satisfiesRange(version: string, range: string): boolean {
 	return false;
 }
 
-async function scanDeps(cwd: string): Promise<{ online: boolean; body: string }> {
+async function scanDeps(cwd: string, signal?: AbortSignal): Promise<{ online: boolean; body: string }> {
 	const pkgPath = resolve(cwd, "package.json");
 	const pkg = await readFile(pkgPath, "utf-8").catch(() => null);
 	if (!pkg) {
@@ -208,7 +210,7 @@ async function scanDeps(cwd: string): Promise<{ online: boolean; body: string }>
 	}
 	const deps = { ...(manifest.dependencies ?? {}), ...(manifest.devDependencies ?? {}) };
 
-	const auditOutput = await runNpmAudit(cwd);
+	const auditOutput = await runNpmAudit(cwd, signal);
 	if (auditOutput !== null) {
 		return { online: true, body: formatAuditReport(auditOutput) };
 	}
@@ -250,7 +252,7 @@ async function resolveInstalledVersion(cwd: string, name: string): Promise<strin
 	}
 }
 
-function runNpmAudit(cwd: string): Promise<string | null> {
+function runNpmAudit(cwd: string, signal?: AbortSignal): Promise<string | null> {
 	const isWindows = process.platform === "win32";
 	const command = isWindows ? "npm.cmd" : "npm";
 	const args = ["audit", "--json"];
@@ -258,12 +260,40 @@ function runNpmAudit(cwd: string): Promise<string | null> {
 		? { executable: process.env.ComSpec ?? "cmd.exe", args: ["/d", "/c", command, ...args] }
 		: { executable: command, args };
 	return new Promise((resolveExec) => {
+		let settled = false;
+		const done = (value: string | null): void => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			signal?.removeEventListener("abort", onAbort);
+			resolveExec(value);
+		};
 		const child = spawn(invocation.executable, invocation.args, {
 			cwd,
 			env: process.env,
 			stdio: ["ignore", "pipe", "pipe"],
 			windowsHide: true,
 		});
+		const onAbort = (): void => {
+			try {
+				if (isWindows) {
+					spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
+				}
+			} catch {
+				// fall through to direct kill
+			}
+			try {
+				child.kill("SIGKILL");
+			} catch {
+				// already gone
+			}
+			done(null);
+		};
+		if (signal?.aborted) {
+			onAbort();
+			return;
+		}
+		signal?.addEventListener("abort", onAbort, { once: true });
 		let out = "";
 		let err = "";
 		child.stdout?.on("data", (chunk: Buffer) => {
@@ -273,24 +303,26 @@ function runNpmAudit(cwd: string): Promise<string | null> {
 			err += chunk.toString("utf-8");
 		});
 		const timer = setTimeout(() => {
-			child.kill("SIGKILL");
-			resolveExec(null);
+			try {
+				child.kill("SIGKILL");
+			} catch {
+				// already gone
+			}
+			done(null);
 		}, 60_000);
 		child.on("error", () => {
-			clearTimeout(timer);
-			resolveExec(null);
+			done(null);
 		});
 		child.on("close", () => {
-			clearTimeout(timer);
 			if (!out.trim()) {
-				resolveExec(null);
+				done(null);
 				return;
 			}
 			try {
 				JSON.parse(out);
-				resolveExec(out);
+				done(out);
 			} catch {
-				resolveExec(null);
+				done(null);
 			}
 		});
 	});
@@ -333,17 +365,17 @@ export function createScanTool(cwd: string): AgentTool<typeof scanSchema> {
 			"list when offline). Run after writing code and before committing.",
 		parameters: scanSchema,
 		promptSnippet: "scan the project for secrets and vulnerable dependencies",
-		async execute(_call, { scope, path }) {
+		async execute(call, { scope, path }) {
 			const root = resolveScanRoot(cwd, path);
 			const wantSecrets = scope !== "deps";
 			const wantDeps = scope !== "secrets";
 			const parts: string[] = [];
 			if (wantSecrets) {
-				const findings = await collectSecrets(root);
+				const findings = await collectSecrets(root, call.signal);
 				parts.push(formatSecrets(findings, root));
 			}
 			if (wantDeps) {
-				const deps = await scanDeps(cwd);
+				const deps = await scanDeps(cwd, call.signal);
 				parts.push(deps.body);
 			}
 			return { content: parts.join("\n\n") };
