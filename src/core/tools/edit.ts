@@ -103,7 +103,6 @@ export function createEditTool(cwd: string): AgentTool<typeof editSchema> {
 		description:
 			"Make a targeted text replacement in a file. The old_string must match exactly once (unless replaceAll is set). Use write() to create or replace whole files.",
 		parameters: editSchema,
-		promptSnippet: "edit a file with an exact string replacement",
 		async execute(_call, { path, oldString, newString, replaceAll }) {
 			const absolute = resolvePath(cwd, path);
 			await assertReadableFile(absolute);

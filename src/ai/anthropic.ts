@@ -2,7 +2,7 @@ import type { AssistantMessage, Message, Usage } from "../core/types.ts";
 import { isDeepSeekProvider, normalizeReasoningEffort, type ReasoningEffort } from "../core/reasoning-effort.ts";
 import { EventStream } from "../core/event-stream.ts";
 import { readSse } from "./sse.ts";
-import { affinityHeaders, estimateTokens, fetchWithRetry, HttpError, parseJsonArguments, sanitizeMessages } from "./utils.ts";
+import { affinityHeaders, applyImageBudget, applyToolBudget, DEFAULT_MAX_IMAGE_BYTES, describeOversizeBody, estimateTokens, fetchWithRetry, HttpError, IMAGE_BUDGET_SHRINKS, MIN_IMAGE_BYTES, parseJsonArguments, sanitizeMessages, TEXT_HEADROOM_BYTES } from "./utils.ts";
 import type { Context, GroundEvent, ProviderAdapter, ProviderStreamOptions } from "./types.ts";
 
 type AnthropicStreamEvent =
@@ -29,9 +29,10 @@ type AnthropicStreamEvent =
 	| { type: "ping" }
 	| { type: "error"; error?: { message?: string } };
 
-async function toAnthropicMessages(context: Context): Promise<unknown[]> {
+async function toAnthropicMessages(context: Context, imageBudget: number): Promise<{ messages: unknown[]; evicted: number }> {
 	const { resolveAttachment } = context;
-	const messages = sanitizeMessages(context.messages);
+	const budgeted = applyImageBudget(applyToolBudget(sanitizeMessages(context.messages)).messages, imageBudget);
+	const messages = budgeted.messages;
 	const out: unknown[] = [];
 	let i = 0;
 	while (i < messages.length) {
@@ -127,7 +128,7 @@ async function toAnthropicMessages(context: Context): Promise<unknown[]> {
 	if (lastBlock && lastBlock.type === "text") {
 		(lastBlock as { cache_control?: { type: "ephemeral" } }).cache_control = { type: "ephemeral" };
 	}
-	return out;
+	return { messages: out, evicted: budgeted.evicted };
 }
 
 /** Thinking-token budgets per effort level; `max` is clamped by max_tokens anyway. */
@@ -162,52 +163,83 @@ async function runStream(
 
 	const baseUrl = (options?.baseUrl ?? model.baseUrl ?? "https://api.anthropic.com").replace(/\/$/, "");
 	let maxTokens = options?.maxTokens ?? model.maxTokens ?? 4096;
-	const body: Record<string, unknown> = {
-		model: model.id,
-		max_tokens: maxTokens,
-		messages: await toAnthropicMessages(context),
-		stream: true,
-	};
-	if (context.systemPrompt) {
-		body.system = [{ type: "text", text: context.systemPrompt, cache_control: { type: "ephemeral" } }];
-	}
-	if (context.tools?.length) {
-		body.tools = context.tools.map((t) => ({
-			name: t.name,
-			description: t.description,
-			input_schema: t.parameters ?? { type: "object", properties: {} },
-		}));
-	}
-	if (model.thinking) {
-		// Anthropic requires temperature to be omitted (or 1) while thinking is
-		// enabled, so we skip setting temperature in that case.
-		const effort = normalizeReasoningEffort(model.reasoningEffort) ?? "high";
-		if (effort === "none") {
-			body.thinking = { type: "disabled" };
-		} else {
-			if (options?.maxTokens === undefined && model.maxTokens === undefined) {
-				maxTokens = Math.max(maxTokens, THINKING_BUDGETS[effort] + MIN_VISIBLE_TOKENS);
-				body.max_tokens = maxTokens;
-			}
-			const budget = Math.min(
-				THINKING_BUDGETS[effort],
-				Math.max(1024, maxTokens - MIN_VISIBLE_TOKENS),
-				maxTokens - 1,
-			);
-			body.thinking = {
-				type: "enabled",
-				budget_tokens: budget,
-			};
-			// DeepSeek's Anthropic-compatible endpoint ignores budget_tokens and
-			// only honours output_config.effort; the native API keeps the budget.
-			if (isDeepSeekProvider(model.id, baseUrl)) body.output_config = { effort };
-		}
-	} else if (options?.temperature !== undefined) {
-		body.temperature = options.temperature;
-	}
+	let imageBudget = options?.maxImageBytes ?? DEFAULT_MAX_IMAGE_BYTES;
+	if (!(imageBudget > 0)) imageBudget = DEFAULT_MAX_IMAGE_BYTES;
+	let evictedImages = 0;
 
 	try {
-		const response = await fetchWithRetry(
+		let shrinks = 0;
+		let rawBody = "";
+		let bodyBytes = 0;
+		let response: Response;
+		for (;;) {
+			const converted = await toAnthropicMessages(context, imageBudget);
+			evictedImages = converted.evicted;
+			const body: Record<string, unknown> = {
+				model: model.id,
+				max_tokens: maxTokens,
+				messages: converted.messages,
+				stream: true,
+			};
+		if (context.systemPrompt) {
+			body.system = [{ type: "text", text: context.systemPrompt, cache_control: { type: "ephemeral" } }];
+		}
+		if (context.tools?.length) {
+			body.tools = context.tools.map((t) => ({
+				name: t.name,
+				description: t.description,
+				input_schema: t.parameters ?? { type: "object", properties: {} },
+			}));
+		}
+		if (model.thinking) {
+			// Anthropic requires temperature to be omitted (or 1) while thinking is
+			// enabled, so we skip setting temperature in that case.
+			const effort = normalizeReasoningEffort(model.reasoningEffort) ?? "high";
+			if (effort === "none") {
+				body.thinking = { type: "disabled" };
+			} else {
+				if (options?.maxTokens === undefined && model.maxTokens === undefined) {
+					maxTokens = Math.max(maxTokens, THINKING_BUDGETS[effort] + MIN_VISIBLE_TOKENS);
+					body.max_tokens = maxTokens;
+				}
+				const budget = Math.min(
+					THINKING_BUDGETS[effort],
+					Math.max(1024, maxTokens - MIN_VISIBLE_TOKENS),
+					maxTokens - 1,
+				);
+				body.thinking = {
+					type: "enabled",
+					budget_tokens: budget,
+				};
+				// DeepSeek's Anthropic-compatible endpoint ignores budget_tokens and
+				// only honours output_config.effort; the native API keeps the budget.
+				if (isDeepSeekProvider(model.id, baseUrl)) body.output_config = { effort };
+			}
+		} else if (options?.temperature !== undefined) {
+			body.temperature = options.temperature;
+		}
+
+		rawBody = JSON.stringify(body);
+		bodyBytes = Buffer.byteLength(rawBody, "utf-8");
+		if (bodyBytes > imageBudget + TEXT_HEADROOM_BYTES) {
+			stream.push({
+				type: "error",
+				message: {
+					role: "assistant",
+					content: [],
+					api: "anthropic-messages",
+					provider: model.provider,
+					model: model.id,
+					usage: { input: 0, output: 0, totalTokens: 0 },
+					stopReason: "error",
+					errorMessage: describeOversizeBody(bodyBytes, evictedImages),
+					timestamp: Date.now(),
+				},
+			});
+			stream.end();
+			return;
+		}
+		response = await fetchWithRetry(
 			`${baseUrl}/v1/messages`,
 			{
 				method: "POST",
@@ -217,19 +249,32 @@ async function runStream(
 					"anthropic-version": "2023-06-01",
 					...affinityHeaders(baseUrl, options?.sessionId),
 				},
-				body: JSON.stringify(body),
+				body: rawBody,
 				signal: options?.signal,
 			},
 			3,
 		);
 
 		if (!response.ok) {
+			if (
+				response.status === 413 &&
+				shrinks < IMAGE_BUDGET_SHRINKS &&
+				Math.floor(imageBudget / 2) >= MIN_IMAGE_BYTES
+			) {
+				shrinks++;
+				imageBudget = Math.floor(imageBudget / 2);
+				continue;
+			}
 			const errorBody = await response.text().catch(() => "");
 			throw new HttpError(
-				`Anthropic API error ${response.status}: ${errorBody.slice(0, 500)}`,
+				response.status === 413
+					? describeOversizeBody(bodyBytes, evictedImages)
+					: `Anthropic API error ${response.status}: ${errorBody.slice(0, 500)}`,
 				response.status,
 				errorBody,
 			);
+		}
+		break;
 		}
 
 		stream.push({ type: "start" });

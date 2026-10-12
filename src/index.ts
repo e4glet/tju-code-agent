@@ -1,7 +1,7 @@
 /**
  * tju-code - a self-extensible coding agent framework.
  *
- * Public API mirroring the layering of the pi agent harness:
+ * Public API layering:
  *  core (agent runtime + tools) and ai (unified provider layer).
  */
 export * from "./core/index.ts";

@@ -1,6 +1,6 @@
 # Tju code 编程智能体工具
 
-由天津大学系统安全与可信计算研究中心内部自研的 coding agent 工具，参考借鉴开源工具 `pi` 的架构与`opencode`的执行质量设计，目标是：省 token、高缓存命中率、可靠的工具调用。
+由天津大学系统安全与可信计算研究中心内部自研的 coding agent 工具，设计目标是：省 token、高缓存命中率、可靠的工具调用、可控的本地安全边界。
 
 ![alt text](image-1.png)
 
@@ -12,15 +12,17 @@
 
 - 双层 agent 循环（外层 turn 循环 + 内层 provider 流式读取），天然适配流式 UI。
 - 统一 AI 层：OpenAI 兼容（chat/completions）与 Anthropic Messages，SSE 流式解析。
-- 内建工具集：`read` / `bash` / `edit` / `write` / `apply_patch` / `grep` / `glob` / `fetch` / `scan` + 会话级 `todowrite` 计划工具 + `task` 子代理委托，参数用 zod schema 校验。
+- 内建工具集：`read` / `bash` / `edit` / `write` / `apply_patch` / `grep` / `glob` / `fetch` / `scan`，加会话级 `todowrite` 计划工具、`task` 子代理委托与 `ask_user` 提问工具，参数用 zod schema 校验。
 - 可靠执行：工具参数 JSON 非法或输出被截断的 tool call 一律不执行并要求重发；write 原子写、read 行数截断、edit 失败附带上下文、apply_patch 一次调用跨多文件顺序增改删（失败时列出已应用操作）、Windows bash 进程树清理、bash 报"命令未识别"时附等价替代提示、fetch 限流/截断/超时/中止。
 - 联网查询体验：`fetch` 联网时 CLI/GUI 显示【正在联网查询中】与完成状态，不直接回显网页原始 HTML；抓取内容交由 AI 提取关键信息后以摘要/回答形式呈现给用户。
 - 内建安全扫描：`scan` 工具做密钥泄露检查（API key / token / 私钥等常见模式）与依赖漏洞检查（`npm audit` 联网查，离线降级内置高危名单）；write/edit 后自动追加安全提示，把检查"左移"到编码阶段。
 - 高可用：provider 瞬时错误（429/5xx/网络）指数退避自动重试；provider 报 context 溢出时自动强制压缩并重试一次；**SSE 流停滞超时**——provider 中途沉默 120s 即报错、不再无限挂起；任一 hook 抛错不打断整轮。
-- 复杂任务韧性：多步任务用 `todowrite` 先列计划再逐步勾选（清单经工具结果留在会话中，GUI 以 `- [~] 内容 (high)` 可视化）；**`task` 子代理委托**——把自包含子任务委托给有界嵌套 agent（独立上下文、默认 5 轮、结果摘要回传），主会话保持精简，复杂任务无需拉高 `--max-turns`（默认 50 即可）；**自动纠偏**——检测到重复调用同一工具（≥3 次）或整轮空转时，注入一次纠偏提示拉回主线（`afterTurn` hook，可自定义）；撞上轮数上限时，最后收尾轮禁用工具并强制模型给出「已完成 / 未完成任务 / 下一步建议」的结构化交接说明。系统提示词已引导：审阅整个目录/模块、全量审计等大块独立工作用 `task` 拆解，避免主对话被细节撑爆。
+- 复杂任务韧性：多步任务用 `todowrite` 先列计划再逐步勾选（清单经工具结果留在会话中，GUI 以 `- [~] 内容 (high)` 可视化）；**`task` 子代理委托**——把自包含子任务委托给有界嵌套 agent（独立上下文、默认 5 轮、结果摘要回传），主会话保持精简，复杂任务无需拉高 `--max-turns`（默认 50 即可）；**自动纠偏**——检测到重复调用同一工具（≥3 次）或整轮空转时注入一次纠偏提示拉回主线（`afterTurn` hook，可自定义）；撞上轮数上限时，最后收尾轮禁用工具并强制模型给出「已完成 / 未完成任务 / 下一步建议」的结构化交接说明。系统提示词已引导：审阅整个目录/模块、全量审计等大块独立工作用 `task` 拆解，避免主对话被细节撑爆。
 - 上下文与缓存：`transformContext` 接入 `compactTranscript`，超预算时用 LLM 生成结构化 `<conversation-checkpoint>` 摘要（Objective / Work State / Next Move 等）保留工作记忆，已有摘要时增量合并，失败回退保守裁剪；预算内不动前缀以保持缓存命中；usage 记录缓存读/写，`/status` 展示命中率。
+- 出站瘦身：每次发请求前按预算裁剪旧内容（落盘 transcript 不动，只换出站拷贝）——图片按字节预算驱逐旧配图，旧工具参数与回执按 token 预算截断，避免长会话把请求体撑爆。
+- 项目约定自动加载：工作目录下的 `AGENTS.md`（没有才用 `CLAUDE.md`，只取其一）自动拼进系统提示，随工作项切换刷新，`task` 子代理同样读到（见下文「项目约定自动加载」）。
 - 端点穿插 hooks：`transformContext`（上下文压缩/截断/注入的入口）、`beforeToolCall` / `afterToolCall`、`getSteeringMessages` / `getFollowUpMessages`。
-- **运行中注入引导（steering）**：agent 正在跑时，直接在输入框敲补充要求按 `Enter` 即可注入（`Shift+Enter` 换行），当前工具调用结束后、下一轮开始时模型就带上了你的最新指示；输入框上方显示 `⟳ 待注入：…` 小胶囊，被接收时消失。停止仍走主按钮（运行中变为停止图标），不会误注入。
+- **运行中注入引导（steering）**：agent 正在跑时，直接在输入框敲补充要求按 `Enter` 即可注入（`Shift+Enter` 换行），当前工具调用结束后、下一轮开始时模型就带上了你的最新指示。
 - 两种界面：
   - CLI `chat`：终端交互会话。
   - GUI `gui`：本地 HTTP + SSE 服务器 + 浏览器界面（默认 `http://localhost:9399`），内置「对话 / 轨迹」双页签，轨迹页签可视化每次 run 的工具调用与耗时（见下文「GUI 轨迹功能」）。
@@ -28,17 +30,11 @@
 
 ## 快速开始
 
-要求：Node >= 20。
+要求：Node >= 20（推荐 20–22）。
 
-推荐：
-- Node 20-22 之间。
-
-### 初始化环境依赖
 ```bash
 npm install
 ```
-
-### 界面
 
 - `chat`：终端交互会话（默认命令）。
 - `gui`：浏览器界面，默认打开 `http://localhost:9399`（`--no-open` 可禁止自动打开浏览器，`--port` 改端口）。
@@ -53,11 +49,13 @@ npm install
 
 | 预设 | 接口地址 | 默认模型 | API key 环境变量 |
 | --- | --- | --- | --- |
-| `deepseek` | https://api.deepseek.com | `deepseek-v4-flash` | `DEEPSEEK_API_KEY` |
-| `kimi` | https://api.moonshot.cn/v1 | `moonshot-v1-8k` | `MOONSHOT_API_KEY` |
+| `deepseek` | https://api.deepseek.com | `deepseek-flash` | `DEEPSEEK_API_KEY` |
+| `kimi` | https://api.moonshot.cn/v1 | `kimi-k2.7-code` | `MOONSHOT_API_KEY` |
 | `qwen` | https://dashscope.aliyuncs.com/compatible-mode/v1 | `qwen-max` | `DASHSCOPE_API_KEY` |
+| `opencode` | https://opencode.ai/zen/go/v1 | `deepseek-v4.1-flash` | `OPENCODE_GO_API_KEY` |
+| `openai` | https://api.openai.com/v1 | `gpt-6.1-sol` | `OPENAI_API_KEY` |
 
-推荐使用`deepseek v4 flash 0731`。
+推荐使用 `deepseek-flash`（官方统一命名，加版本号也会路由到该模型）。
 
 Windows PowerShell：
 
@@ -85,7 +83,7 @@ npm run dev -- --profile deepseek --model deepseek-v4-pro
 `--api-key` / `--base-url` / `--model` 三件套直接给：
 
 ```powershell
-npm run dev:gui -- --api-key sk-你的key --base-url https://api.deepseek.com --model deepseek-v4-flash
+npm run dev:gui -- --api-key sk-你的key --base-url https://api.deepseek.com --model deepseek-flash
 ```
 
 注意：`--base-url` 需要与 OpenAI 兼容格式匹配，程序会拼上 `/chat/completions`（如 DeepSeek 传 `https://api.deepseek.com`，Moonshot 传 `https://api.moonshot.cn/v1`）。Anthropic 接口切 `--api anthropic-messages`，走 `/v1/messages`。
@@ -109,6 +107,7 @@ npm run dev -- `
 | `deepseek` | `DEEPSEEK_API_KEY` | `DEEPSEEK_BASE_URL` | 仅 `--model` |
 | `kimi` | `MOONSHOT_API_KEY` | `MOONSHOT_BASE_URL` | 仅 `--model` |
 | `qwen` | `DASHSCOPE_API_KEY` | `DASHSCOPE_BASE_URL` | 仅 `--model` |
+| `openai` | `OPENAI_API_KEY` | `OPENAI_BASE_URL` | 仅 `--model` |
 
 各预设的模型名只能通过 `--model` 修改。
 
@@ -120,32 +119,34 @@ OpenAI 兼容接口用 `OPENAI_API_KEY` / `OPENAI_BASE_URL`，Anthropic 用 `ANT
 
 打开 GUI → 左下角**设置**齿轮 → **接口**页签，可以**新增 / 修改 / 删除**任意接口（名称、协议 OpenAI 兼容 / Anthropic、接口地址、默认模型、API key），点「测试连接」会真实请求 `/models` 校验地址与 key；点「使用」把该接口设为当前接口（输入框右侧的下拉框也能随时切换）。
 
-配置存放在本机两个**纯文本文件**（就是"内置的那份本地 json"）：
+配置存放在本机两个**纯文本文件**：
 
 | 文件 | 内容 |
 | --- | --- |
-| `~/.tju-code/providers.json` | 接口条目（id / 显示名 / 协议 / 地址 / 默认模型），带 `schemaVersion` |
-| `~/.tju-code/secrets.json` | 每个接口的 API key（Windows 下按当前用户账户隔离，仅本机可读） |
+| `<数据目录>/providers.json` | 接口条目（id / 显示名 / 协议 / 地址 / 默认模型），带 `schemaVersion` |
+| `<数据目录>/secrets.json` | 每个接口的 API key（Windows 下按当前用户账户隔离，仅本机可读） |
+
+数据目录默认 `~/.tju-code`（`dist` 旁边存在 `data/` 时用 `./data`，可用 `--data-dir` 或 `TJU_CODE_HOME` 覆盖）。
 
 **key 只存在 `secrets.json` 里，不会写进 `providers.json`。**
 
-内置的厂商预设（deepseek / kimi / qwen）是**只读**的；想改内置预增设的默认地址或模型，编辑它会生成一条**同 id 的用户覆盖**，删除该覆盖即恢复内置默认。
+内置的厂商预设是**只读**的；想改内置预增设的默认地址或模型，编辑它会生成一条**同 id 的用户覆盖**，删除该覆盖即恢复内置默认。
 
 #### 双击启动脚本（.bat）的行为
 
 仓库根目录的 `启动.bat` / `启动-gui.bat` 顶部 CONFIG 区可以填 `API_KEY` / `BASE_URL` / `MODEL`：
 
 1. **第一次双击**：脚本里的 `BASE_URL` / `API_KEY` / `MODEL` 会被**自动导入**成本机接口（第一个叫 `启动脚本`，之后的不同地址/模型叫 `启动脚本·xxx`），存进本机 `providers.json` + `secrets.json`，并自动切到它。
-2. **之后双击同一个脚本**：以本机保存的配置为准——你在「设置 → 接口」里对它的任何修改都会被保留（脚本不再覆盖），因此不会每次启动都把你的改动冲掉。
-3. **多个脚本累加**：按"地址 + 模型"区分，每个不同的组合各存一条、互不覆盖；双击哪个脚本就自动选中它对应的条目。同地址多模型（如同平台的三个模型各一个 bat）同样各存一条。
-4. **完全没有配置过的脚本**（CONFIG 区留空）：**依然可以正常启动**，GUI 会打开「设置 → 接口」并提示先配置；在界面里填好接口和 key 后就能直接对话，不需要再改脚本。
+2. **之后双击同一个脚本**：以本机保存的配置为准——你在「设置 → 接口」里对它的任何修改都会被保留（脚本不再覆盖）。
+3. **多个脚本累加**：按"地址 + 模型"区分，每个不同的组合各存一条、互不覆盖；双击哪个脚本就自动选中它对应的条目。
+4. **完全没有配置过的脚本**（CONFIG 区留空）：**依然可以正常启动**，GUI 会打开「设置 → 接口」并提示先配置。
 
 > 想让脚本参数**始终优先**（不走导入、每次以脚本为准），在脚本里显式加 `--profile <接口id>` 即可。
-> 在界面里**删除**了 `启动脚本` 这个接口，但脚本里 `BASE_URL` 还填着：下次双击会**重新导入**（"双击带配置的脚本"即视为你要用它）。想永久弃用，把脚本 CONFIG 区的 `BASE_URL` 清空即可。
+> 在界面里**删除**了 `启动脚本` 这个接口，但脚本里 `BASE_URL` 还填着：下次双击会**重新导入**。想永久弃用，把脚本 CONFIG 区的 `BASE_URL` 清空即可。
 
 ### 多工作项
 
-CLI 与图形界面都支持**多个独立会话（工作项）**并存，持久化在 `~/.tju-code/works/`（每个工作项一个子目录，原子写入 `work-item.json`；可用 `--session-dir` 改变存储目录）。
+CLI 与图形界面都支持**多个独立会话（工作项）**并存，持久化在 `<数据目录>/works/`（每个工作项一个子目录，原子写入 `work-item.json`；可用 `--session-dir` 改变存储目录）。
 
 **GUI**：左侧边栏「工作项」列表展示全部工作项的数量与名称，支持：
 
@@ -169,15 +170,23 @@ CLI 与图形界面都支持**多个独立会话（工作项）**并存，持久
 - 切换工作项时，工具与审批门同时换到该目录（只影响后续调用，历史对话不变）；改当前项的目录即时生效，忙时需等本轮结束。
 - **改目录要经过一次确认框**：弹窗里会写明"审批边界随之切换"，点"确认变更"才真正生效——这是有意设计的安全确认，防止模型在你不知情时把工作区挪到别处（如 `C:\`）。新建时填了与当前不同的目录，同样要走这一次确认。
 - 确认凭证只存在你最初打开的那个浏览器标签页里：**书签 / 新标签页直接打开、确认时报"缺少确认凭证"，用最初自动打开的那个页面操作即可**（或复制启动日志里的完整 URL 重新打开）。
+- 切换目录后系统提示词会同步更新为新的工作目录，模型下一轮即按新目录解析相对路径（历史里的旧绝对路径可能已失效）。
+
+### 项目约定自动加载（AGENTS.md / CLAUDE.md）
+
+- 每个工作目录下的 `AGENTS.md` 会自动拼进系统提示（没有才用 `CLAUDE.md`，只取其一不合并）；切换工作项或改目录时跟着重读刷新，`task` 子代理的提示里同样会带上。
+- 注入的是"项目约定"而非系统指令：正文前有显式声明，与安全规则冲突时安全规则优先。
+- 只读工作目录以内的文件：路径先 `realpath` 解析再比对，不在目录内的（如指向外部的符号链接）一律不读；文件分级处理：≤50KB 全量注入；50KB–1MB 截断到 50KB 并附提示行；>1MB 整个不读。
+- 想给某个项目定制行为，在该目录放一个 `AGENTS.md` 即可；没有也不影响使用。
 
 ### 目录访问权限
 
-工具（read / write / edit / grep / bash / scan）首次访问**工作目录之外**的目录时，会向你确认授权；"总是允许"记住该目录（含子目录），还可以选"总是允许上级 `D:\xxx\*`"一次覆盖整棵树，避免同级目录反复弹窗；拒绝则本次操作被阻止（模型会收到"未授权"的提示）。bash 命令里出现本机回环地址（`127.x` / `localhost`，如 `curl http://127.0.0.1:9399/`）同样会弹窗确认，防止模型在你不知情时访问本机服务；`fetch` 访问回环地址则直接拒绝（模型传参也绕不过）。`curl 公网地址 -o %TEMP%\...` 这类命令如果弹窗，弹的是环境变量展开后的输出文件目录（如 Temp），属于正常行为，不是误报。`fetch` 是纯网络工具，不读本地文件系统，不受目录权限限制。审批只识别**独立盘符路径**（如 `D:\...`），`redis://` / `https://` 等协议串不会被误判成 `s:\` / `p:\` 而误弹授权框。
+工具（read / write / edit / grep / bash / scan）首次访问**工作目录之外**的目录时，会向你确认授权；"总是允许"记住该目录（含子目录），还可以选"总是允许上级 `D:\xxx\*`"一次覆盖整棵树，避免同级目录反复弹窗；拒绝则本次操作被阻止（模型会收到"未授权"的提示）。bash 命令里出现本机回环地址（`127.x` / `localhost`，如 `curl http://127.0.0.1:9399/`）同样会弹窗确认；`fetch` 访问回环地址则直接拒绝（模型传参也绕不过）。`curl 公网地址 -o %TEMP%\...` 这类命令如果弹窗，弹的是环境变量展开后的输出文件目录（如 Temp），属于正常行为，不是误报。`fetch` 是纯网络工具，不读本地文件系统，不受目录权限限制。审批只识别**独立盘符路径**（如 `D:\...`），`redis://` / `https://` 等协议串不会被误判成 `s:\` / `p:\` 而误弹授权框。
 
 - CLI：终端里输入 `y` 允许、`n` 拒绝。
 - GUI：页面弹出"允许一次 / 总是允许 / 总是允许上级* / 拒绝"四个按钮。
 - 工作目录内的读写不受影响，无需确认。
-- **符号链接无法绕过授权**：目录边界判断会先用 `realpath` 解析符号链接、再比较，工作目录内一个指向外部的 junction / 符号链接（如指向 `C:\Users\<你>\.ssh`）**不会**被当成“目录内”而静默放行；弹窗里显示的是**真实物理路径**而不是链接名。所以克隆并直接运行不受信任的第三方仓库时，模型无法靠仓库里的链接把敏感文件读走而不弹窗。（同类缺陷在 Claude Code、Roo Code 等产品上对应 CVE-2025-59829 / CVE-2026-25724 / CVE-2025-58373。）
+- **符号链接无法绕过授权**：目录边界判断会先用 `realpath` 解析符号链接、再比较，工作目录内一个指向外部的 junction / 符号链接（如指向 `C:\Users\<你>\.ssh`）**不会**被当成"目录内"而静默放行；弹窗里显示的是**真实物理路径**而不是链接名。所以克隆并直接运行不受信任的第三方仓库时，模型无法靠仓库里的链接把敏感文件读走而不弹窗。
 
 ### 联网安全（fetch 的 SSRF 防护）
 
@@ -201,12 +210,12 @@ node dist/cli.js --profile deepseek   # 会话里对模型说"扫描项目安全
 
 本工具的工具集是**完全封闭**的，这是有意设计：
 
-- 全部工具在 `createAllTools()` 中硬编码，只有 `read` / `bash` / `edit` / `write` / `apply_patch` / `grep` / `fetch` / `scan` 八个，加会话级 `todowrite` 与 `task`；
+- 全部工具在 `createAllTools()` 中硬编码，只有 `read` / `bash` / `edit` / `write` / `apply_patch` / `grep` / `glob` / `fetch` / `scan` 九个，加会话级 `todowrite`、`task` 与 `ask_user`；
 - 工具 `description` 是源码内的静态字符串，不会在运行时从外部或远程拉取；
-- 参数由固定的 zod schema 在调用前 `safeParse` 严格校验，未知工具名直接返回 `Tool not found`，模型无法“创造”出新工具；
+- 参数由固定的 zod schema 在调用前 `safeParse` 严格校验，未知工具名直接返回 `Tool not found`，模型无法"创造"出新工具；
 - **没有任何从外部加载或注册第三方工具的机制**（`plugins/` 下的插件只做 GUI 侧扩展、通过 SSE 订阅事件，不参与 agent 的工具选择）。
 
-因此 XTHP（Cross-Tool Harvesting and Polluting，UIUC / NDSS 2026）一类“工具池投毒”攻击的前提——agent 批量导入社区第三方工具、工具描述可被攻击者篡改、模型自主挑选——在本工具中**不成立**。
+因此"工具池投毒"一类攻击的前提——agent 批量导入社区第三方工具、工具描述可被攻击者篡改、模型自主挑选——在本工具中**不成立**。
 
 ### 思考模式与推理强度
 
@@ -231,12 +240,29 @@ CLI 在模型思考（未输出正文）时会显示一行灰色 `[思考中...]
 
 右上角设置齿轮（⚙）打开设置弹窗，分「通用 / 接口 / 更新」三个页签：
 
-- **通用**：**Enter 发送**（默认关闭）：勾选后按 `Enter` 直接发送、`Shift+Enter` 换行；不勾选时按 `Ctrl`（macOS 为 `Cmd`）+ `Enter` 发送。选择即时生效并持久化到浏览器本地（`localStorage`），输入框 placeholder 会同步提示当前快捷键。
-  - 中文输入法组合态（IME composing）下按 Enter 只确认候选词，不会误发送。
-- **接口**：新增 / 修改 / 删除任意接口（名称、协议 OpenAI 兼容 / Anthropic、接口地址、默认模型、API key），点「测试连接」会真实请求校验地址与 key；点「使用」把该接口设为当前接口（顶部输入框右侧的下拉框也能随时切换）。详见上文「方式四」。**不用敲命令**：配接口、换模型、填 key 全在图形界面里点完。
+- **通用**：**Enter 发送**（默认关闭）：勾选后按 `Enter` 直接发送、`Shift+Enter` 换行；不勾选时按 `Ctrl`（macOS 为 `Cmd`）+ `Enter` 发送。选择即时生效并持久化到浏览器本地（`localStorage`）。中文输入法组合态（IME composing）下按 Enter 只确认候选词，不会误发送。
+- **接口**：新增 / 修改 / 删除任意接口，点「测试连接」会真实请求校验地址与 key；点「使用」把该接口设为当前接口（顶部输入框右侧的下拉框也能随时切换）。详见上文「方式四」。**不用敲命令**：配接口、换模型、填 key 全在图形界面里点完。
 - **更新**：显示当前版本号，一键检查 / 安装 / 回滚，详见下文「GUI 自更新」。**不用拷文件**：有新版点几下按钮、重启服务即完成升级。
 
 运行中的「停止」入口在**发送按钮本身**：运行期间发送按钮变为停止图标，点击即中止当前 run（不再单独设顶栏中止按钮）。
+
+### 运行中注入引导（steering）
+
+agent 正在执行时，你仍可以直接纠正它——**不需要先停止、再重新提问**：
+
+| 场景 | 输入框为空 | 输入框有内容 |
+| --- | --- | --- |
+| 运行中按 `Enter` | 无操作 | **注入引导**（`Shift+Enter` 仍换行） |
+| 运行中按 `Ctrl`/`Cmd`+`Enter` | 无操作 | **注入引导** |
+| 运行中点击主按钮 | **停止**（图标为方块） | **停止**（语义不变） |
+| 运行中点击副按钮 | 隐藏 | **注入引导** |
+
+- 注入的文本会立刻清空输入框，并在输入框上方显示一个 `⟳ 待注入：<内容>` 小胶囊。
+- 当前这一轮工具调用跑完后、下一轮开始时，胶囊消失，对话流里出现你的这条消息（用户气泡），模型即按新指示继续。
+- 若模型本轮已经打算收尾（不再调用工具），同一条引导仍会在它停止前被取走、模型再走一轮，所以"最后关头"的纠正同样生效。
+- 若在你敲回车与请求到达之间这一轮恰好结束，服务端会把它当作一条普通新消息处理，胶囊自动移除，文本不会被吞掉。
+
+鼠标路径：运行中输入内容后，主按钮**左侧**会出现一个箭头副按钮（`→|`），点击即注入。这样主按钮始终保持"停止"语义，避免"想停止却注入"的误操作。运行中输入框 placeholder 会变为"补充引导：Enter 注入（AI 将在下一步收到），Shift+Enter 换行..."。
 
 ### GUI 自更新
 
@@ -256,35 +282,16 @@ CLI 在模型思考（未输出正文）时会显示一行灰色 `[思考中...]
 - **任务执行中**点更新 / 回滚 / 重启会被拒绝（等本轮结束再点）。
 - **发版流程**（维护者）：改 `package.json` 版本号 → `npm run build`（版本号此刻 baked 进包，**改号后必须重新 build 再 pack**）→ `npm run pack:update`（生成 `update/`：`latest.json` + 版本全量文件）→ 把 `update/` 传到静态服务器。客户端用"检查更新"验证 manifest 可达后再通知用户升级。
 
-#### 运行中注入引导（steering）
-
-agent 正在执行时，你仍可以直接纠正它——**不需要先停止、再重新提问**：
-
-| 场景 | 输入框为空 | 输入框有内容 |
-| --- | --- | --- |
-| 运行中按 `Enter` | 无操作 | **注入引导**（`Shift+Enter` 仍换行） |
-| 运行中按 `Ctrl`/`Cmd`+`Enter` | 无操作 | **注入引导** |
-| 运行中点击主按钮 | **停止**（图标为方块） | **停止**（语义不变） |
-| 运行中点击副按钮 | 隐藏 | **注入引导** |
-
-- 注入的文本会立刻清空输入框，并在输入框上方显示一个 `⟳ 待注入：<内容>` 小胶囊，表示它已在队列里等待。
-- 当前这一轮工具调用跑完后、下一轮开始时，胶囊消失，对话流里出现你的这条消息（用户气泡），模型即按新指示继续。
-- 若模型本轮已经打算收尾（不再调用工具），同一条引导仍会在它停止前被取走、模型再走一轮，所以“最后关头”的纠正同样生效。
-- 若在你敲回车与请求到达之间这一轮恰好结束，服务端会把它当作一条普通新消息处理，胶囊自动移除，文本不会被吞掉。
-
-鼠标路径：运行中输入内容后，主按钮**左侧**会出现一个箭头副按钮（`→|`），点击即注入。这样主按钮始终保持“停止”语义，避免“想停止却注入”的误操作。运行中输入框 placeholder 会变为“补充引导：Enter 注入（AI 将在下一步收到），Shift+Enter 换行...”。
-
 ### GUI 轨迹功能
 
-浏览器界面顶部栏有「对话 / 轨迹」两个页签，轨迹页签把每次运行（run）可视化为一组**横向轨迹条**，dsh 风格的事件溯源视图：
+浏览器界面顶部栏有「对话 / 轨迹」两个页签，轨迹页签把每次运行（run）可视化为一组**横向轨迹条**：
 
 - **实时 run 在最上方**，历史 run 按时间倒序往下排；每条轨迹条头部 = caret + 时间徽标 + 迷你时间线 + 首条用户消息摘要 + 工具数，点击头部展开/收起。
 - 展开后是**台账式分轮列表**：每轮一个可折叠区块（轮头 sticky），块内每行 = 全局序号 + 类型标签（USER 绿 / ASSISTANT 蓝 / TOOL 琥珀 pill）+ 文本 + 行尾指标列（Input / Output / Think / Time）。TOOL 行内联 `→ 结果`（运行中/成功/失败三色），ASSISTANT 报错显示红色 `→ 错误详情` 整行标红，纯工具调用的 ASSISTANT 行显示 `调用 工具名(参数)`。
 - **点击任意轨迹行可展开完整详情**：行下方内联面板显示该行的完整参数与完整结果（TOOL）或完整文本（USER/ASSISTANT），可滚动、可复制；同一轮内同时只展开一行。完整内容取自内存（历史 run 经事件日志按需回放），页面存储仍只保留截断摘要，不放大本地存储。
 - 概览条与迷你条为 Chrome 网络面板式时间线，颜色与台账一致，一眼看出每轮/每个工具调用占用多少时间。
 - **右键历史 run 的头部**会弹出上下文菜单，可「删除该 run」，确认后连同其事件日志一并删除（实时 run 无菜单）。
-- 轨迹数据全部来自 SSE AgentEvent，并持久化到 `localStorage`（`tju.gui.traj`）；刷新页面自动重建当前轨迹。历史 run 的事件日志落盘在 `~/.tju-code/logs`（`--log-dir` 可改，`--log-retention` 控制保留天数），刷新/重连时会回放已落盘事件，进行中的轨迹不丢失。事件日志读取走流式（`node:readline` 逐行），大 run 不整文件载入内存。
-- **多工作项**：`~/.tju-code/works` 持久化每个工作项的完整会话（消息 + todo + 模型），启动自动恢复上次工作项；工作项在**每轮结束后自动保存**（防抖 1.5s，退出时冲刷），运行中断/进程被杀也不会丢对话；切换工作项时对话区按核心 transcript 重建——用户消息、思考+回答、以及按 `toolCallId` 配对的**工具块（参数+结果）**都会还原，不会丢失工具调用信息；历史 run 的完整轨迹仍可从「轨迹」页签回放。
+- 轨迹数据全部来自 SSE AgentEvent，并持久化到 `localStorage`（`tju.gui.traj`）；刷新页面自动重建当前轨迹。历史 run 的事件日志落盘在 `<数据目录>/logs`（`--log-dir` 可改，`--log-retention` 控制保留天数），刷新/重连时会回放已落盘事件，进行中的轨迹不丢失。事件日志读取走流式（`node:readline` 逐行），大 run 不整文件载入内存。
 
 ### 桌宠插件（pet）
 
@@ -299,7 +306,7 @@ GUI 内建一个 Live2D 风格的桌宠，位于浏览器窗口右下角，随�
 ```
 plugins/pet/
 ├── pet.js          # 插件入口（状态机 + 渲染 + 拖拽 + SSE 订阅）
-└── assets/         # 30 个 WebP 精灵图（从 deepseek-pet-main 移植）
+└── assets/         # 30 个 WebP 精灵图
 ```
 
 ### CLI 命令
@@ -329,7 +336,7 @@ plugins/pet/
 ```bash
 npm run build   # 产物 dist/，bin 指向 dist/cli.js
 npm run typecheck
-npm test        # 18 个测试文件 / 176 项（1 项仅 POSIX，Windows 跳过）
+npm test        # 20 个测试文件 / 219 项（1 项仅 POSIX，Windows 跳过）
 ```
 
 ### 使用编译产物（dist/）
@@ -375,7 +382,7 @@ npm test        # 18 个测试文件 / 176 项（1 项仅 POSIX，Windows 跳过
    | `PORT` | `9399` | GUI 端口（仅 gui 脚本） |
 
    > bat 脚本双击运行，结束/报错时会 `pause` 等待按键；路径含中文可正常使用（脚本已 `chcp 65001` 切 UTF-8）。
-   > 脚本里的 `API_KEY` / `BASE_URL` 是**首次导入**用的引导值：导入后以本机 `~/.tju-code/providers.json` 为准，界面里的修改不会被下次双击覆盖（详见上文「方式四」）。
+   > 脚本里的 `API_KEY` / `BASE_URL` 是**首次导入**用的引导值：导入后以本机 `providers.json` 为准，界面里的修改不会被下次双击覆盖。
 
 - **库（dist/index.js + index.d.ts）**：作为编程接口被其他项目引用。
 
@@ -403,21 +410,23 @@ Commands:
 
 Flags:
   --api <openai-completions|anthropic-messages>
-  --profile <deepseek|kimi|qwen>
+  --profile <deepseek|kimi|qwen|opencode|openai>
   --provider <id>     --model <id>
   --api-key <key>     --base-url <url>
   --no-thinking       关闭思考模式（默认开启）
   --max-tokens <n>    单次输出上限
   --max-context-tokens <n>  上下文预算（默认 128000，超出自动压缩）
+  --max-image-bytes <n>   单次请求图片预算字节数（默认 8388608=8MB，超出自动省略旧图，落盘原图不动）
   --max-turns <n>      每轮 run 的最大 turn 数（默认 50，超出强制收尾）
   --port <n>（gui）   --no-open
   --update-url <url> 自更新源地址（GUI 设置→更新页用；也可配 TJU_UPDATE_URL）
-  --log-dir <path>     运行事件日志目录（默认 ~/.tju-code/logs）
+  --log-dir <path>     运行事件日志目录（默认 <数据目录>/logs）
   --log-retention <n>  事件日志保留天数（默认 7）
-  --session-dir <path> 工作项持久化目录（默认 ~/.tju-code/works）
+  --data-dir <path>    数据目录（providers.json / secrets.json / works / logs，默认 ~/.tju-code）
+  --session-dir <path> 工作项持久化目录（默认 <数据目录>/works）
 ```
 
-环境变量：`OPENAI_API_KEY` / `OPENAI_BASE_URL` / `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL`，厂商预设各自的 `<厂商>_API_KEY`。
+环境变量：`OPENAI_API_KEY` / `OPENAI_BASE_URL` / `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL`，厂商预设各自的 `<厂商>_API_KEY`，以及 `TJU_CODE_HOME`（数据目录）、`TJU_UPDATE_URL`（更新源）。
 
 ## 架构
 
@@ -440,7 +449,7 @@ CLI/GUI -> Agent (stateful) -> runAgentLoop -> ai layer (OpenAI/Anthropic adapte
 
 - **添加 provider**：实现 `src/ai/types.ts` 的 `ProviderAdapter`（`api` + `stream`），在 `src/ai/index.ts` 注册。
 - **自定义工具**：`src/core/types.ts` 的 `AgentTool`，用 `zod` 给出 `parameters` 即可被 `createAgent` 使用。
-- **运行钩子**：见 `src/core/types.ts` 的 `AgentLoopConfig`，特别是 `transformContext`--上下文压缩/截断/注入的唯一入口（现接入 `compactTranscript`，LLM 结构化摘要压缩）。
+- **运行钩子**：见 `src/core/types.ts` 的 `AgentLoopConfig`，特别是 `transformContext`——上下文压缩/截断/注入的唯一入口（现接入 `compactTranscript`，LLM 结构化摘要压缩）。
 - **GUI 插件**：在 `plugins/` 下创建子目录，放入 `pet.js` 入口文件，启动时自动扫描加载。插件通过 SSE 订阅 AgentEvent，可自由扩展 GUI 行为。
 
 ## 目录
@@ -451,12 +460,10 @@ src/
   core/     agent 运行时（agent / agent-loop / event-stream / types / tools）
   gui/      HTTP + SSE 服务器与内嵌前端
   cli/      chat 交互会话
-  config/   create-agent -> CLI 组装
+  config.ts / create-agent.ts   配置解析与 CLI 组装
 plugins/
   pet/      桌宠插件（纯前端，零侵入主项目）
 ```
-
-
 
 ## 研究机构
 

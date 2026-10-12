@@ -74,6 +74,7 @@ export const VIEW_HTML = `<!DOCTYPE html>
       </section>
       <section class="composer">
         <div class="todo-dock" id="todo-dock" hidden></div>
+        <div class="question-dock" id="question-dock" hidden></div>
         <div class="chat-box">
           <div class="attach-strip" id="attach-strip" hidden></div>
           <div class="steer-strip" id="steer-strip" hidden></div>
@@ -149,17 +150,6 @@ export const VIEW_HTML = `<!DOCTYPE html>
     <button id="approval-no" class="approval-btn">拒绝</button>
   </div>
 </div>
-<div class="modal-backdrop" id="question-backdrop" hidden>
-  <div class="modal question-modal" role="dialog" aria-modal="true" aria-labelledby="question-title">
-    <div class="modal-title" id="question-title">需要你确认</div>
-    <div class="modal-text" id="question-text"></div>
-    <div id="question-options"></div>
-    <input class="modal-input" id="question-input" placeholder="或直接输入你的选择…" autocomplete="off" />
-    <div class="modal-actions">
-      <button class="modal-btn primary" id="question-submit" type="button">确定</button>
-    </div>
-  </div>
-</div>
 <div class="traj-menu" id="traj-menu" hidden>
   <button id="traj-menu-delete" class="traj-menu-item danger">删除该 run</button>
   <button id="traj-menu-delete-earlier" class="traj-menu-item danger" hidden>删除更早的全部 run</button>
@@ -182,6 +172,21 @@ export const VIEW_HTML = `<!DOCTYPE html>
         </span>
         <input type="checkbox" id="opt-enter-send" class="settings-check" />
       </label>
+      <label class="settings-row" for="opt-sound">
+        <span class="settings-label">
+          <span class="settings-name">提示音</span>
+          <span class="settings-hint">任务成功 / 失败 / 等待确认时播放提示音</span>
+        </span>
+        <input type="checkbox" id="opt-sound" class="settings-check" checked />
+      </label>
+      <div class="settings-row sound-sub" id="sound-sub">
+        <span class="settings-label">
+          <span class="settings-name">提示音类型</span>
+          <label class="sound-opt" for="opt-sound-ok"><input type="checkbox" id="opt-sound-ok" class="settings-check" checked /> 成功</label>
+          <label class="sound-opt" for="opt-sound-err"><input type="checkbox" id="opt-sound-err" class="settings-check" checked /> 失败</label>
+          <label class="sound-opt" for="opt-sound-ask"><input type="checkbox" id="opt-sound-ask" class="settings-check" checked /> 提问与审批</label>
+        </span>
+      </div>
       <div class="settings-row">
         <span class="settings-label">
           <span class="settings-name">当前接口 <span class="update-ver" id="provider-current">-</span></span>
@@ -587,6 +592,12 @@ li { margin: 4px 0; }
 }
 .copy svg { flex-shrink: 0; display: block; }
 .copy:hover { color: var(--accent); border-color: var(--accent); }
+.msg-footer { display: flex; align-items: center; gap: 9px; margin: 9px 0 0 14px; }
+.msg-footer .copy { margin: 0; border: 0; background: transparent; box-shadow: none; padding: 2px; color: var(--faint); }
+.msg-footer .copy:hover { color: var(--accent); background: var(--accent-soft); border-color: transparent; }
+.msg-meta { font-size: 12.5px; color: var(--muted); user-select: text; }
+.msg-meta .sep { color: var(--faint); margin: 0 6px; }
+.msg-meta .time { color: var(--faint); }
 .thinking { margin-bottom: 10px; }
 .thinking summary {
   display: flex; align-items: center; gap: 6px; width: fit-content; padding: 3px 10px 3px 4px;
@@ -968,6 +979,10 @@ li { margin: 4px 0; }
 .settings-name { font-size: 13px; font-weight: 600; color: var(--text); }
 .settings-hint { font-size: 12px; line-height: 1.55; color: var(--muted); }
 .settings-check { flex: none; width: 17px; height: 17px; margin-top: 2px; accent-color: var(--accent); cursor: pointer; }
+.sound-sub .settings-label { gap: 8px; }
+.sound-sub.disabled { opacity: .5; }
+.sound-opt { display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 500; color: var(--text); cursor: pointer; }
+.sound-opt .settings-check { margin-top: 0; }
 .update-ver {
   font-family: "SF Mono", "JetBrains Mono", "Fira Code", Consolas, monospace;
   font-size: 12px; color: var(--muted); font-weight: 500;
@@ -1116,9 +1131,42 @@ html[data-theme="dark"] .provider-select {
 .approval-btn.always-btn { border-color: var(--accent); color: var(--accent); }
 #approval-parent { max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .approval-btn:hover { filter: brightness(1.05); }
-.question-modal { width: min(480px, 100%); }
+.question-dock { max-width: 788px; margin: 0 auto 8px; }
+.question-card {
+  background: var(--panel); border: 1px solid var(--accent); box-shadow: var(--shadow);
+  border-radius: 12px; overflow: hidden; font-size: 13px;
+}
+.question-head {
+  display: flex; align-items: center; gap: 8px;
+  padding: 9px 12px; font-weight: 600;
+}
+.question-badge {
+  flex: none; font-size: 11px; border-radius: 999px; padding: 1px 8px; color: #fff;
+  background: var(--accent);
+}
+.question-title {
+  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.question-count {
+  flex: none; font-size: 12px; color: var(--muted); font-weight: 500;
+  font-family: "SF Mono", "JetBrains Mono", "Fira Code", Consolas, monospace;
+}
+.question-x {
+  flex: none; border: 0; background: transparent; color: var(--faint);
+  width: 24px; height: 24px; border-radius: 6px; cursor: pointer;
+  display: flex; align-items: center; justify-content: center; font-size: 15px; line-height: 1;
+  padding: 0;
+}
+.question-x:hover { background: var(--code); color: var(--err); }
+.question-body { padding: 0 12px 12px; }
+.question-text {
+  margin: 2px 0 4px; font-size: 13px; line-height: 1.6; color: var(--text);
+  white-space: pre-wrap; word-break: break-word;
+}
 .question-opt { display: block; width: 100%; box-sizing: border-box; text-align: left; margin-top: 8px; }
-#question-input { margin-top: 10px; }
+.question-input-row { display: flex; gap: 8px; margin-top: 10px; }
+.question-input-row .modal-input { margin-top: 0; flex: 1; min-width: 0; }
+.question-input-row .modal-btn { flex: none; }
 .drawer-backdrop { display: none; }
 *::-webkit-scrollbar { width: 8px; height: 8px; }
 *::-webkit-scrollbar-track { background: transparent; }
@@ -1194,6 +1242,7 @@ var EMPTY_CARD = '<div class="empty-card">' +
   '<button class="chip" data-quick="用 bash 查看当前目录内容">跑命令</button>' +
   '</div></div>';
 var modelApi = "openai-completions";
+var currentModelId = "";
 var AGENT_TOKEN = "__AGENT_TOKEN__";
 // Short-lived ticket for URLs that cannot carry a header (attachment images).
 var attachmentTicket = "";
@@ -1515,6 +1564,70 @@ function fmtDur(ms) {
   if (s < 60) return s.toFixed(1) + "s";
   var m = Math.floor(s / 60);
   return m + "m" + Math.round(s % 60) + "s";
+}
+function fmtDurCn(ms) {
+  if (!(ms > 0)) return "";
+  var s = Math.round(ms / 1000);
+  if (s < 60) return s + " 秒";
+  var m = Math.floor(s / 60);
+  var rs = s % 60;
+  if (m < 60) return rs ? m + " 分钟 " + rs + " 秒" : m + " 分钟";
+  var h = Math.floor(m / 60);
+  var rm = m % 60;
+  return rm ? h + " 小时 " + rm + " 分钟" : h + " 小时";
+}
+var MODEL_BRANDS = { deepseek: "DeepSeek", gpt: "GPT", qwen: "Qwen", kimi: "Kimi", claude: "Claude", glm: "GLM", gemini: "Gemini", llama: "Llama", mistral: "Mistral", grok: "Grok", doubao: "Doubao", moonshot: "Moonshot", yi: "Yi", o1: "o1", o3: "o3" };
+function prettyModelName(id) {
+  var raw = String(id || "").trim();
+  if (!raw) return "未知模型";
+  var toks = raw.split(/[-_]+/).filter(function (t) { return t; });
+  if (!toks.length) return raw;
+  var out = [];
+  for (var i = 0; i < toks.length; i++) {
+    var t = toks[i];
+    var low = t.toLowerCase();
+    if (MODEL_BRANDS[low]) out.push(MODEL_BRANDS[low]);
+    else if (t.charAt(0) >= "a" && t.charAt(0) <= "z") out.push(t.charAt(0).toUpperCase() + t.slice(1));
+    else out.push(t);
+  }
+  return out.join(" ");
+}
+function effortLabel() {
+  var e = normalizeEffort(currentEffort) || "high";
+  if (e === "none") return "Off";
+  return e.charAt(0).toUpperCase() + e.slice(1);
+}
+function appendAnswerFooter(b) {
+  if (!b || !b._copyBtn) return null;
+  var foot = document.createElement("div");
+  foot.className = "msg-footer";
+  foot.appendChild(b._copyBtn);
+  b._copyBtn = null;
+  b.appendChild(foot);
+  b._answerFooter = foot;
+  return foot;
+}
+function setFooterMeta(foot, ms) {
+  if (!foot) return;
+  var old = foot.querySelector(".msg-meta");
+  if (old) old.remove();
+  var text = fmtDurCn(ms);
+  if (!text) return;
+  var meta = document.createElement("span");
+  meta.className = "msg-meta";
+  var modelSpan = document.createElement("span");
+  modelSpan.className = "model";
+  modelSpan.textContent = prettyModelName(currentModelId) + " (" + effortLabel() + ")";
+  var sep = document.createElement("span");
+  sep.className = "sep";
+  sep.textContent = "·";
+  var timeSpan = document.createElement("span");
+  timeSpan.className = "time";
+  timeSpan.textContent = text;
+  meta.appendChild(modelSpan);
+  meta.appendChild(sep);
+  meta.appendChild(timeSpan);
+  foot.appendChild(meta);
 }
 function tnow() {
   return trajNow !== null ? trajNow : Date.now();
@@ -2359,6 +2472,7 @@ function bubble(cls, textOrHtml, isHtml, attachments, ts) {
   var copyBtn = document.createElement("button");
   copyBtn.className = "copy";
   copyBtn.title = "复制";
+  copyBtn._host = el;
   if (cls === "user") {
     el._answerText = String(textOrHtml == null ? "" : textOrHtml).trim();
   }
@@ -2376,7 +2490,6 @@ function bubble(cls, textOrHtml, isHtml, attachments, ts) {
     revertBtn.textContent = "↩";
     revertBtn._host = el;
     copyBtn.classList.add("user-copy");
-    copyBtn._host = el;
     if (currentRunId) {
       actionBar.setAttribute("data-run", currentRunId);
       revertBtn.setAttribute("data-run", currentRunId);
@@ -2642,7 +2755,11 @@ function restoreState() {
       refreshAttachmentTicket().then(function () { paintAttachmentImages(convInner); });
     }
   }
-  if (model) modelLabel.textContent = model;
+  if (model) {
+    modelLabel.textContent = model;
+    var modelParts = model.split(" / ");
+    currentModelId = modelParts.length > 1 ? modelParts[1] : model;
+  }
   navRender();
   if (cum && typeof cum.in === "number") {
     cumInput = cum.in;
@@ -2767,6 +2884,7 @@ conversation.addEventListener("click", function (ev) {
 });
 
 var pendingAssistant = null;
+var lastAnswerFooter = null;
 var lastTool = null;
 var todoLiveCard = null;
 var runFirstUser = null;
@@ -2783,6 +2901,7 @@ var toolSerial = 0;
 var runStart = null;
 var runTimer = null;
 var runTools = 0;
+var runHadError = false;
 var runTokensIn = 0;
 var runTokensCache = 0;
 var cumTokens = 0;
@@ -2977,6 +3096,8 @@ function handleLiveEvent(e) {
     case "agent_start":
       setStatus("busy");
       runFirstUser = null;
+      runHadError = false;
+      lastAnswerFooter = null;
       finalizeTodoCard();
       runStart = Date.now();
       runTools = 0;
@@ -2995,11 +3116,19 @@ function handleLiveEvent(e) {
     case "agent_end":
       if (runTimer) clearInterval(runTimer);
       runTimer = null;
-      if (runStart !== null) statTime.textContent = fmtDur(Date.now() - runStart);
+      if (runStart !== null) {
+        statTime.textContent = fmtDur(Date.now() - runStart);
+        setFooterMeta(lastAnswerFooter, Date.now() - runStart);
+      }
       runStart = null;
+      lastAnswerFooter = null;
       setStatus("idle");
       pendingAssistant = null;
       finalizeTodoCard();
+      if (soundOn) {
+        if (runHadError) { if (soundErr) playSoundErr(); }
+        else { if (soundOk) playSoundOk(); }
+      }
       scheduleSave();
       saveTraj(liveWs);
       if (liveWs.metaEl) liveWs.metaEl.textContent = "已完成";
@@ -3042,8 +3171,7 @@ case "message_update":
         var answerText = assistantAnswerText(e.message).trim();
         if (pendingAssistant._copyBtn && bodyEl && answerText) {
           pendingAssistant._answerText = answerText;
-          pendingAssistant.appendChild(pendingAssistant._copyBtn);
-          pendingAssistant._copyBtn = null;
+          lastAnswerFooter = appendAnswerFooter(pendingAssistant);
         }
       }
       scrollDown();
@@ -3054,6 +3182,7 @@ case "message_update":
           updateTurnHeader(liveWs.currentTurn);
         }
         if (e.message.stopReason === "error") {
+          runHadError = true;
           bubble("error", e.message.errorMessage || "assistant error");
         }
       }
@@ -3123,6 +3252,7 @@ case "message_update":
       }
       break;
     case "tool_end":
+      if (e.isError) runHadError = true;
       if (liveWs.currentTurn) {
         for (var ti = 0; ti < liveWs.currentTurn.records.length; ti++) {
           if (liveWs.currentTurn.records[ti].id === e.toolCallId) {
@@ -3182,6 +3312,7 @@ function applyModel() {
     body: JSON.stringify({ model: id })
   }).then(function () {
     modelLabel.textContent = modelApi + " / " + id;
+    currentModelId = id;
     modelLabel.hidden = false;
     modelInput.hidden = true;
     scheduleSave();
@@ -3247,6 +3378,7 @@ function applySendMode() {
 }
 function openSettings() {
   applySendMode();
+  applySoundMode();
   switchSettingsTab("general");
   settingsBackdrop.hidden = false;
   optEnterSend.focus();
@@ -3268,6 +3400,90 @@ optEnterSend.addEventListener("change", function () {
   ta.focus();
 });
 applySendMode();
+
+var soundCtx = null;
+function soundAc() {
+  try {
+    if (!soundCtx) soundCtx = new (window.AudioContext || window.webkitAudioContext)();
+    if (soundCtx.state === "suspended") soundCtx.resume();
+    return soundCtx;
+  } catch (e) { return null; }
+}
+function soundTone(freq, t0, dur, vol) {
+  var c = soundAc();
+  if (!c) return;
+  try {
+    var o = c.createOscillator();
+    var g = c.createGain();
+    o.type = "sine";
+    o.frequency.value = freq;
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.exponentialRampToValueAtTime(vol, t0 + 0.02);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    o.connect(g);
+    g.connect(c.destination);
+    o.start(t0);
+    o.stop(t0 + dur + 0.05);
+  } catch (e) {}
+}
+function playSoundOk() {
+  var c = soundAc();
+  if (!c) return;
+  var t = c.currentTime;
+  soundTone(880, t, 0.15, 0.2);
+  soundTone(1320, t + 0.15, 0.18, 0.2);
+}
+function playSoundErr() {
+  var c = soundAc();
+  if (!c) return;
+  var t = c.currentTime;
+  soundTone(330, t, 0.2, 0.22);
+  soundTone(220, t + 0.2, 0.25, 0.22);
+}
+function playSoundAsk() {
+  var c = soundAc();
+  if (!c) return;
+  var t = c.currentTime;
+  soundTone(990, t, 0.1, 0.18);
+  soundTone(990, t + 0.15, 0.1, 0.18);
+  soundTone(990, t + 0.3, 0.15, 0.18);
+}
+var soundOn = true;
+var soundOk = true;
+var soundErr = true;
+var soundAsk = true;
+try {
+  if (localStorage.getItem("tju.gui.sound") === "0") soundOn = false;
+  if (localStorage.getItem("tju.gui.sound.ok") === "0") soundOk = false;
+  if (localStorage.getItem("tju.gui.sound.err") === "0") soundErr = false;
+  if (localStorage.getItem("tju.gui.sound.ask") === "0") soundAsk = false;
+} catch (e) {}
+function applySoundMode() {
+  var m = document.getElementById("opt-sound");
+  var so = document.getElementById("opt-sound-ok");
+  var se = document.getElementById("opt-sound-err");
+  var sa = document.getElementById("opt-sound-ask");
+  var sub = document.getElementById("sound-sub");
+  if (m) m.checked = soundOn;
+  if (so) { so.checked = soundOk; so.disabled = !soundOn; }
+  if (se) { se.checked = soundErr; se.disabled = !soundOn; }
+  if (sa) { sa.checked = soundAsk; sa.disabled = !soundOn; }
+  if (sub) sub.classList.toggle("disabled", !soundOn);
+}
+function bindSoundOpt(id, key, set) {
+  var el = document.getElementById(id);
+  if (!el) return;
+  el.addEventListener("change", function () {
+    set(!!el.checked);
+    try { localStorage.setItem(key, el.checked ? "1" : "0"); } catch (e) {}
+    applySoundMode();
+  });
+}
+bindSoundOpt("opt-sound", "tju.gui.sound", function (v) { soundOn = v; });
+bindSoundOpt("opt-sound-ok", "tju.gui.sound.ok", function (v) { soundOk = v; });
+bindSoundOpt("opt-sound-err", "tju.gui.sound.err", function (v) { soundErr = v; });
+bindSoundOpt("opt-sound-ask", "tju.gui.sound.ask", function (v) { soundAsk = v; });
+applySoundMode();
 
 // ---- settings tabs (通用 / 接口 / 更新) + self update ----
 var settingsTabGeneral = document.getElementById("settings-tab-general");
@@ -4089,6 +4305,7 @@ function clearPendingAttachments() {
 }
 
 function send() {
+  soundAc();
   if (isBusy) {
     fetch("/api/abort", { method: "POST", headers: { "x-agent-token": AGENT_TOKEN } });
     return;
@@ -4615,6 +4832,22 @@ function renderConversation(messages) {
     else convInner.innerHTML = EMPTY_CARD;
     return;
   }
+  var segStart = null;
+  var segEnd = null;
+  var segFooter = null;
+  function finalizeSeg() {
+    if (segFooter && segStart !== null && segEnd !== null && segEnd > segStart) {
+      setFooterMeta(segFooter, segEnd - segStart);
+    }
+    segFooter = null;
+    segStart = null;
+    segEnd = null;
+  }
+  function touchSeg(ts) {
+    if (typeof ts !== "number" || !ts) return;
+    if (segStart === null) segStart = ts;
+    if (segEnd === null || ts > segEnd) segEnd = ts;
+  }
   for (var i = 0; i < messages.length; i++) {
     var m = messages[i];
     if (!m || !m.role) continue;
@@ -4623,14 +4856,17 @@ function renderConversation(messages) {
       var ucontent = typeof m.content === "string" ? m.content : "";
       if (ucontent.indexOf("<conversation-checkpoint>") !== -1) {
         renderCheckpointBlock(ucontent);
-      } else {
-        var ub = bubble("user", ucontent, false, m.attachments, m.timestamp);
-        if (ub._actionBar) {
-          convInner.appendChild(ub._actionBar);
-          ub._actionBar = null;
-        }
+        continue;
+      }
+      if (!m.steering) finalizeSeg();
+      touchSeg(m.timestamp);
+      var ub = bubble("user", ucontent, false, m.attachments, m.timestamp);
+      if (ub._actionBar) {
+        convInner.appendChild(ub._actionBar);
+        ub._actionBar = null;
       }
     } else if (m.role === "assistant") {
+      touchSeg(m.timestamp);
       var thinking = "";
       var text = "";
       var calls = [];
@@ -4647,8 +4883,7 @@ function renderConversation(messages) {
         var answerTrim = text.trim();
         if (b._copyBtn && answerTrim) {
           b._answerText = answerTrim;
-          b.appendChild(b._copyBtn);
-          b._copyBtn = null;
+          segFooter = appendAnswerFooter(b);
         }
       }
       var byId = {};
@@ -4656,6 +4891,7 @@ function renderConversation(messages) {
       while (i + 1 < messages.length && messages[i + 1] && messages[i + 1].role === "toolResult") {
         i++;
         var tr = messages[i];
+        touchSeg(tr.timestamp);
         var call = byId[tr.toolCallId] || null;
         if (tr.toolName === "todowrite" && call && call.arguments) {
           if (!runTodoCard || !runTodoCard.isConnected) {
@@ -4668,9 +4904,11 @@ function renderConversation(messages) {
         }
       }
     } else if (m.role === "toolResult") {
+      touchSeg(m.timestamp);
       renderToolBlock(m.toolName, null, m.content, !!m.isError);
     }
   }
+  finalizeSeg();
   stickToBottom = true;
   scrollDown();
   paintAttachmentImages(convInner);
@@ -5056,24 +5294,13 @@ document.getElementById("approval-always").addEventListener("click", function ()
 document.getElementById("approval-parent").addEventListener("click", function () { if (approvalParentDir) answerApproval("always", approvalParentDir); });
 document.getElementById("approval-no").addEventListener("click", function () { answerApproval("deny"); });
 
-var questionBackdrop = document.getElementById("question-backdrop");
-var questionText = document.getElementById("question-text");
-var questionOptions = document.getElementById("question-options");
-var questionInput = document.getElementById("question-input");
+var questionDock = document.getElementById("question-dock");
 var questionRequestId = null;
 var questionQueue = [];
 
 function hideQuestion() {
   questionRequestId = null;
-  if (questionBackdrop) questionBackdrop.hidden = true;
-  document.removeEventListener("keydown", questionKeyHandler);
-}
-
-function questionKeyHandler(e) {
-  if (e.key === "Escape") {
-    e.preventDefault();
-    cancelQuestion();
-  }
+  if (questionDock) { questionDock.replaceChildren(); questionDock.hidden = true; }
 }
 
 function answerQuestion(choice, cancelled) {
@@ -5101,42 +5328,87 @@ function showNextQuestion() {
 }
 
 function showQuestion(req) {
+  if (!questionDock) return;
   questionRequestId = req.requestId;
-  questionText.textContent = req.question || "";
-  questionOptions.replaceChildren();
+  questionDock.replaceChildren();
+  var card = document.createElement("div");
+  card.className = "question-card";
+  var head = document.createElement("div");
+  head.className = "question-head";
+  var badge = document.createElement("span");
+  badge.className = "question-badge";
+  badge.textContent = "等你确认";
+  head.appendChild(badge);
+  var title = document.createElement("span");
+  title.className = "question-title";
+  title.textContent = "需要你确认";
+  head.appendChild(title);
+  if (questionQueue.length) {
+    var count = document.createElement("span");
+    count.className = "question-count";
+    count.textContent = "还有" + questionQueue.length + "个";
+    head.appendChild(count);
+  }
+  var x = document.createElement("button");
+  x.type = "button";
+  x.className = "question-x";
+  x.title = "取消（自行判断继续）";
+  x.setAttribute("aria-label", "取消提问");
+  x.textContent = "×";
+  x.addEventListener("click", function () { cancelQuestion(); });
+  head.appendChild(x);
+  card.appendChild(head);
+  var body = document.createElement("div");
+  body.className = "question-body";
+  var text = document.createElement("div");
+  text.className = "question-text";
+  text.textContent = req.question || "";
+  body.appendChild(text);
   var opts = Array.isArray(req.options) ? req.options.slice(0, 3) : [];
   for (var i = 0; i < opts.length; i++) {
-    (function (text) {
+    (function (text, idx) {
       var btn = document.createElement("button");
       btn.type = "button";
       btn.className = "modal-btn question-opt";
-      btn.textContent = (i + 1) + ". " + text;
+      btn.textContent = (idx + 1) + ". " + text;
       btn.addEventListener("click", function () { answerQuestion(text); });
-      questionOptions.appendChild(btn);
-    })(String(opts[i]));
+      body.appendChild(btn);
+    })(String(opts[i]), i);
   }
-  questionInput.value = "";
-  questionInput.classList.remove("invalid");
-  questionBackdrop.hidden = false;
-  questionBackdrop.onclick = function (e) { if (e.target === questionBackdrop) cancelQuestion(); };
-  document.addEventListener("keydown", questionKeyHandler);
-  questionInput.focus();
+  var row = document.createElement("div");
+  row.className = "question-input-row";
+  var input = document.createElement("input");
+  input.className = "modal-input";
+  input.placeholder = "或直接输入你的选择…";
+  input.setAttribute("autocomplete", "off");
+  row.appendChild(input);
+  var submit = document.createElement("button");
+  submit.type = "button";
+  submit.className = "modal-btn primary";
+  submit.textContent = "确定";
+  row.appendChild(submit);
+  body.appendChild(row);
+  card.appendChild(body);
+  questionDock.appendChild(card);
+  questionDock.hidden = false;
+  submit.addEventListener("click", function () {
+    var v = input.value.trim();
+    if (!v) {
+      input.classList.add("invalid");
+      input.focus();
+      return;
+    }
+    answerQuestion(v);
+  });
+  input.addEventListener("keydown", function (ev) {
+    if (ev.key === "Enter") {
+      ev.preventDefault();
+      submit.click();
+    }
+    ev.stopPropagation();
+  });
+  try { input.focus(); } catch (e) {}
 }
-document.getElementById("question-submit").addEventListener("click", function () {
-  var v = questionInput.value.trim();
-  if (!v) {
-    questionInput.classList.add("invalid");
-    questionInput.focus();
-    return;
-  }
-  answerQuestion(v);
-});
-questionInput.addEventListener("keydown", function (ev) {
-  if (ev.key === "Enter") {
-    ev.preventDefault();
-    document.getElementById("question-submit").click();
-  }
-});
 
 connectEvents(0);
 var suppressReplay = false;
@@ -5160,6 +5432,7 @@ function handleServerMessage(msg) {
     if (msg.ticket) attachmentTicket = msg.ticket;
     if (msg.state && msg.state.model) {
       modelApi = msg.state.model.api;
+      currentModelId = msg.state.model.id || currentModelId;
       modelLabel.textContent = msg.state.model.api + " / " + msg.state.model.id;
       var svrEffort = normalizeEffort(msg.state.model.reasoningEffort);
       if (svrEffort && svrEffort !== currentEffort) {
@@ -5193,6 +5466,7 @@ function handleServerMessage(msg) {
         if (approvalQueue[ai].requestId === msg.request.requestId) { dup = true; break; }
       }
       if (!dup && approvalRequestId !== msg.request.requestId) approvalQueue.push(msg.request);
+      if (!dup && soundOn && soundAsk) playSoundAsk();
       showNextApproval();
     } else {
       approvalRequestId = null;
@@ -5208,6 +5482,7 @@ function handleServerMessage(msg) {
         if (questionQueue[qi].requestId === qreq.requestId) qdup = true;
       }
       if (!qdup) questionQueue.push(qreq);
+      if (!qdup && soundOn && soundAsk) playSoundAsk();
       showNextQuestion();
     } else {
       questionRequestId = null;

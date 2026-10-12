@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { runAgentLoop } from "../agent-loop.ts";
+import { readProjectDocs, withProjectDocs, withWorkingDirectory } from "../../config.ts";
 import type {
 	AgentContext,
 	AgentLoopConfig,
@@ -40,12 +41,14 @@ const SUBAGENT_MAX_TURNS = 5;
 const MAX_RESULT_CHARS = 8000;
 
 function subAgentSystemPrompt(cwd: string): string {
-	return [
+	const base = [
 		`You are a sub-agent working inside the project directory ${cwd}.`,
 		"Complete the delegated task precisely using the available tools (read, search, edit, run commands as needed).",
 		"Work autonomously and verify your work. Do not create todo lists and do not ask for clarification unless truly blocked.",
 		"When done, return a concise summary of what you did and the outcome. It is returned to the orchestrating agent, so include exact file paths, commands run, and results.",
 	].join("\n");
+	const docs = readProjectDocs(cwd);
+	return withWorkingDirectory(withProjectDocs(base, docs), cwd);
 }
 
 function assistantText(message: AssistantMessage): string {
@@ -68,7 +71,6 @@ export function createSubAgentTool(options: SubAgentToolOptions): AgentTool<type
 		description:
 			"Delegate a self-contained subtask to a sub-agent that runs its own focused loop (bounded turns) and returns a concise summary. Use for isolated, well-scoped work so the main conversation stays lean. The sub-agent cannot delegate further or touch the main todo list.",
 		parameters: subAgentSchema,
-		promptSnippet: "delegate an isolated subtask to a sub-agent",
 		async execute(call, { task }) {
 			const subSystemPrompt = subAgentSystemPrompt(options.cwd);
 			const subConfig: AgentLoopConfig = {

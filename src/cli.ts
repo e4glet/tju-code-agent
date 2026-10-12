@@ -175,6 +175,7 @@ Flags:
   --base-url <url>      Custom API base URL
   --max-tokens <n>      Max output tokens
   --max-context-tokens <n>  Trim/drop transcript when input exceeds this (default 128000)
+  --max-image-bytes <n>     Cap outbound image bytes per request (default 8388608); oldest images are omitted past it
   --max-turns <n>           Max assistant turns per run before a forced summary (default 50)
   --no-thinking         Disable extended thinking (enabled by default)
   --port <n>            GUI port (default 9399)

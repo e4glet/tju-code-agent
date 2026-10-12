@@ -35,8 +35,8 @@ const FLUSH_BATCH = 200;
 
 /**
  * Append-only JSONL event log for one run. Events are buffered and written
- * with a write-behind timer (mirroring dsh's session persistence) so hot
- * streams like message_update do not open a file handle per event.
+ * with a write-behind timer so hot streams like message_update do not open a
+ * file handle per event.
  */
 export class EventLog {
 	readonly path: string;

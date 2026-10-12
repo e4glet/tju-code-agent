@@ -356,7 +356,6 @@ export function createFetchTool(): AgentTool<typeof fetchSchema> {
 			"Follows redirects. Limits response size to protect context. " +
 			"Use for reading online documentation, checking API responses or scraping simple pages.",
 		parameters: fetchSchema,
-		promptSnippet: "fetch a URL from the internet",
 		async execute(call, { url, maxBytes, timeout, allowPrivate }) {
 			let parsed: URL;
 			try {

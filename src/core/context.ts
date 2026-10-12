@@ -15,7 +15,7 @@ const KEEP_MESSAGES_MIN = 4;
 /** Recent tail kept verbatim when the older history is summarized. */
 const KEEP_RECENT_TOKENS = 8_000;
 
-/** Tool output serialized into the summary prompt is truncated at this many characters. */
+/** Tool output and tool-call arguments serialized into the summary prompt are truncated at this many characters. */
 const TOOL_OUTPUT_MAX_CHARS = 2_000;
 
 /** Upper bound for the generated structured summary. */
@@ -32,8 +32,11 @@ function messageText(message: Message): string {
 			return message.content;
 		case "assistant":
 			return message.content
-				.filter((c) => c.type === "text" || c.type === "thinking")
-				.map((c) => (c.type === "text" ? c.text : c.thinking))
+				.map((c) => {
+					if (c.type === "text") return c.text;
+					if (c.type === "thinking") return c.thinking;
+					return `${c.name}(${JSON.stringify(c.arguments)})`;
+				})
 				.join("\n");
 	}
 }
@@ -170,27 +173,33 @@ When combining:
 - If a blocker has been resolved, update the summary to reflect that while keeping any details still needed to continue the work.
 - Update "Objective" and "Next Move" to reflect the current work state.`;
 
-function serializeMessage(message: Message): string {
+export function serializeMessage(message: Message): string {
 	switch (message.role) {
 		case "user":
 			return `[User]: ${message.content}`;
-		case "toolResult": {
-			const text =
-				message.content.length > TOOL_OUTPUT_MAX_CHARS
-					? `${message.content.slice(0, TOOL_OUTPUT_MAX_CHARS)}\n[truncated]`
-					: message.content;
-			return `[Tool result${message.isError ? " error" : ""}]: ${text}`;
-		}
+		case "toolResult":
+			return `[Tool result${message.isError ? " error" : ""}]: ${clip(message.content)}`;
 		case "assistant": {
 			const parts: string[] = [];
 			for (const c of message.content) {
 				if (c.type === "text" && c.text) parts.push(`[Assistant]: ${c.text}`);
 				else if (c.type === "thinking" && c.thinking) parts.push(`[Assistant reasoning]: ${c.thinking}`);
-				else if (c.type === "toolCall") parts.push(`[Assistant tool call]: ${c.name}(${JSON.stringify(c.arguments)})`);
+				else if (c.type === "toolCall") parts.push(`[Assistant tool call]: ${c.name}(${clip(JSON.stringify(c.arguments))})`);
 			}
 			return parts.join("\n");
 		}
 	}
+}
+
+/**
+ * Cap a serialized chunk before it goes into the summary prompt. Summarizing a
+ * long session would otherwise build a prompt far larger than the budget: a
+ * single `write`/`edit` call carries a whole file body, and a few hundred of
+ * them run to hundreds of thousands of characters, so the summary request
+ * itself is rejected and compaction falls back to dropping whole turns.
+ */
+function clip(text: string): string {
+	return text.length > TOOL_OUTPUT_MAX_CHARS ? `${text.slice(0, TOOL_OUTPUT_MAX_CHARS)}\n[truncated]` : text;
 }
 
 function extractTag(text: string, tag: string): string | undefined {

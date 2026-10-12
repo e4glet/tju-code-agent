@@ -73,7 +73,6 @@ export function createTodoTool(store: TodoStore): AgentTool<typeof todoSchema> {
 		description:
 			"Create and maintain a structured task list for the current coding session. Use it to track progress during multi-step work and keep todo statuses current. Pass the full updated list each time. Each item has content, a status (pending|active|completed) and an optional priority (low|medium|high).",
 		parameters: todoSchema,
-		promptSnippet: "track multi-step work with a todo list",
 		async execute(_call, { todos }) {
 			store.todos = todos.map((t) => ({
 				content: t.content,

@@ -29,6 +29,8 @@ export interface AgentOptions {
 	temperature?: number;
 	/** Token budget for the transcript. When exceeded, messages are compressed. */
 	maxContextTokens?: number;
+	/** Cap on outbound image bytes per request. Older images are omitted past it. */
+	maxImageBytes?: number;
 	/** Maximum assistant turns per run before the loop forces a final summary turn. */
 	maxTurns?: number;
 	/** Shared todo list holder; its contents are injected into the request context each turn. */
@@ -85,6 +87,7 @@ export class Agent {
 	private maxTokens?: number;
 	private temperature?: number;
 	private maxContextTokens?: number;
+	private maxImageBytes?: number;
 	private maxTurns?: number;
 	private askCountThisRun = 0;
 	private beforeToolCall?: AgentOptions["beforeToolCall"];
@@ -105,6 +108,7 @@ export class Agent {
 		this.maxTokens = options.maxTokens;
 		this.temperature = options.temperature;
 		this.maxContextTokens = options.maxContextTokens;
+		this.maxImageBytes = options.maxImageBytes;
 		this.maxTurns = options.maxTurns;
 		this.todoStore = options.todoStore;
 		this.beforeToolCall = options.beforeToolCall;
@@ -148,6 +152,13 @@ export class Agent {
 			throw new Error("Cannot replace tools while streaming. Wait for the run to finish first.");
 		}
 		this.tools = tools.slice();
+	}
+
+	setSystemPrompt(prompt: string): void {
+		if (this.isStreaming) {
+			throw new Error("Cannot replace the system prompt while streaming. Wait for the run to finish first.");
+		}
+		this.systemPrompt = prompt;
 	}
 
 	setBeforeToolCall(hook: AgentOptions["beforeToolCall"]): void {
@@ -203,6 +214,7 @@ export class Agent {
 	steer(input: string | Message): void {
 		const message: Message =
 			typeof input === "string" ? { role: "user", content: input, timestamp: Date.now() } : input;
+		if (message.role === "user") message.steering = true;
 		this.steeringQueue.push(message);
 	}
 
@@ -301,6 +313,7 @@ export class Agent {
 			apiKey: this.provider.apiKey,
 			sessionId: this.provider.sessionId,
 			maxTokens: this.maxTokens,
+			maxImageBytes: this.maxImageBytes,
 			temperature: this.temperature,
 			systemPrompt: this.systemPrompt,
 			tools: this.tools,

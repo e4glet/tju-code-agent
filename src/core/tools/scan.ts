@@ -364,7 +364,6 @@ export function createScanTool(cwd: string): AgentTool<typeof scanSchema> {
 			"and checks dependencies for known vulnerabilities via npm audit (falls back to a built-in known-vulnerability " +
 			"list when offline). Run after writing code and before committing.",
 		parameters: scanSchema,
-		promptSnippet: "scan the project for secrets and vulnerable dependencies",
 		async execute(call, { scope, path }) {
 			const root = resolveScanRoot(cwd, path);
 			const wantSecrets = scope !== "deps";

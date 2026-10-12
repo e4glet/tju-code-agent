@@ -74,3 +74,18 @@ describe("buildAgentTools", () => {
 		expect(after.content).toContain("from-b");
 	});
 });
+
+describe("createAgent system prompt", () => {
+	it("embeds the working directory and project docs", () => {
+		const dir = freshDir();
+		writeFileSync(join(dir, "AGENTS.md"), "project rules here");
+		const prompt = createAgent({ config: BASE_CONFIG, cwd: dir }).state.systemPrompt;
+		expect(prompt).toContain(dir);
+		expect(prompt).toContain("project rules here");
+	});
+
+	it("omits the docs section when the directory has no docs", () => {
+		const prompt = createAgent({ config: BASE_CONFIG, cwd: freshDir() }).state.systemPrompt;
+		expect(prompt).not.toContain("Project conventions:");
+	});
+});

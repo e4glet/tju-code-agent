@@ -58,7 +58,6 @@ export function createGrepTool(cwd: string): AgentTool<typeof grepSchema> {
 			"Search file contents for a regular expression pattern. Prefer this over shell findstr/grep: one call shows matches with surrounding context, so there is usually no need to re-read the same region. " +
 			"Searches recursively, skipping node_modules/.git and large or binary files. Use glob to find files by name first.",
 		parameters: grepSchema,
-		promptSnippet: "search file contents",
 		async execute(call, { pattern, path, include, context, caseInsensitive }) {
 			const root = path ? (isAbsolute(path) ? path : resolve(cwd, path)) : cwd;
 			let regex: RegExp;

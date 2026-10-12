@@ -339,6 +339,7 @@ async function streamAssistantResponse(
 		const eventStream = await stream(config.model, providerContext, {
 			apiKey: config.apiKey,
 			maxTokens: config.maxTokens,
+			maxImageBytes: config.maxImageBytes,
 			temperature: config.temperature,
 			sessionId: config.sessionId,
 			signal,

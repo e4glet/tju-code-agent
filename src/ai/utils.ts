@@ -1,4 +1,4 @@
-import type { AssistantMessage, Message } from "../core/types.ts";
+import type { AssistantMessage, Attachment, Message, UserMessage } from "../core/types.ts";
 import { APP_VERSION } from "../version.ts";
 
 const OPENCODE_HOST_RE = /(^|\.)opencode\.ai$/i;
@@ -99,9 +99,185 @@ export function parseJsonArguments(text: string): Record<string, unknown> | null
 }
 
 /** Rough token estimate used when the provider reports no usage. */
+const CJK_RE = /[、-鿿぀-ヿ가-힯　-〿＀-￯𠀀-𪚺]/u;
+
 export function estimateTokens(text: string): number {
 	if (!text) return 0;
-	return Math.max(1, Math.ceil(text.length / 4));
+	let cjk = 0;
+	let other = 0;
+	for (const char of text) {
+		if (CJK_RE.test(char)) cjk++;
+		else other += char.length;
+	}
+	return Math.max(1, Math.ceil(cjk + other / 4));
+}
+
+export const DEFAULT_MAX_IMAGE_BYTES = 8 * 1024 * 1024;
+export const MIN_IMAGE_BYTES = 256 * 1024;
+export const IMAGE_BUDGET_SHRINKS = 2;
+export const TEXT_HEADROOM_BYTES = 4 * 1024 * 1024;
+
+export interface ImageBudgetResult {
+	messages: Message[];
+	evicted: number;
+}
+
+function attachmentBase64Bytes(size: unknown): number {
+	if (typeof size !== "number" || !Number.isFinite(size) || size <= 0) return Number.POSITIVE_INFINITY;
+	return Math.ceil((size * 4) / 3);
+}
+
+export function applyImageBudget(messages: Message[], maxImageBytes: number): ImageBudgetResult {
+	const budget = maxImageBytes > 0 ? maxImageBytes : DEFAULT_MAX_IMAGE_BYTES;
+	const refs: Array<{ msg: number; att: number; bytes: number }> = [];
+	messages.forEach((message, msg) => {
+		if (message.role !== "user") return;
+		(message.attachments ?? []).forEach((attachment: Attachment, att: number) => {
+			if (attachment.kind !== "image") return;
+			refs.push({ msg, att, bytes: attachmentBase64Bytes(attachment.size) });
+		});
+	});
+	if (refs.length === 0) return { messages, evicted: 0 };
+	let total = 0;
+	for (const ref of refs) {
+		total += ref.bytes;
+		if (total > budget) break;
+	}
+	if (total <= budget) return { messages, evicted: 0 };
+	const keep = new Set<number>();
+	let used = 0;
+	for (let i = refs.length - 1; i >= 0; i--) {
+		const ref = refs[i]!;
+		if (ref.bytes <= budget && used + ref.bytes <= budget) {
+			keep.add(i);
+			used += ref.bytes;
+		}
+	}
+	const dropByMsg = new Map<number, number[]>();
+	let evicted = 0;
+	refs.forEach((ref, i) => {
+		if (keep.has(i)) return;
+		evicted++;
+		const list = dropByMsg.get(ref.msg) ?? [];
+		list.push(ref.att);
+		dropByMsg.set(ref.msg, list);
+	});
+	if (evicted === 0) return { messages, evicted: 0 };
+	const out = messages.map((message, msg) => {
+		const drops = dropByMsg.get(msg);
+		if (!drops || message.role !== "user") return message;
+		const source = message as UserMessage;
+		const dropSet = new Set(drops);
+		const kept = (source.attachments ?? []).filter((_, att) => !dropSet.has(att));
+		const names = drops.map((att) => source.attachments?.[att]?.name || "image");
+		const note = `\n\n[Attached image${names.length > 1 ? "s" : ""} omitted to fit the request size budget: ${names.join(", ")}]`;
+		return {
+			...source,
+			attachments: kept.length ? kept : undefined,
+			content: source.content + note,
+		};
+	});
+	return { messages: out, evicted };
+}
+
+/** Tool result bodies and tool-call argument JSON kept verbatim outside the recent window. */
+export const HISTORY_TOOL_ARG_MAX_CHARS = 500;
+export const HISTORY_TOOL_RESULT_MAX_CHARS = 500;
+
+/**
+ * How many trailing tokens of the transcript keep full tool arguments and tool
+ * results. Everything older is reduced: the call record, its id and its name
+ * stay (providers require each call to be answered by exactly one result), only
+ * the bulky payload is replaced by a placeholder.
+ */
+export const TOOL_BUDGET_KEEP_TOKENS = 8_000;
+
+const OMITTED_RESULT = "[Old tool result content cleared]";
+
+/** Payload a message contributes to the retention window (its bulky parts only). */
+function payloadText(message: Message): string {
+	switch (message.role) {
+		case "user":
+			return "";
+		case "toolResult":
+			return message.content;
+		case "assistant":
+			return message.content
+				.filter((c) => c.type === "toolCall")
+				.map((c) => JSON.stringify(c.arguments))
+				.join("\n");
+	}
+}
+
+export interface ToolBudgetResult {
+	messages: Message[];
+	trimmedCalls: number;
+	clearedResults: number;
+}
+
+/**
+ * Shrink the outbound copy of an old transcript without touching what is
+ * persisted. A single `write`/`edit` call carries a whole file body, so a long
+ * session sends hundreds of thousands of characters of arguments and results
+ * the model no longer needs: it does not re-read a file it wrote an hour ago.
+ *
+ * Only the recent window is kept verbatim. Older tool calls keep their id and
+ * name (the pairing providers validate) but lose the argument JSON beyond a
+ * small prefix; older tool results are replaced by a placeholder. User messages
+ * are never touched, so requirements stay visible.
+ *
+ * The cut is a pure function of the message list, so once the window scrolls
+ * the prefix stays stable and prompt caching recovers on the next turn.
+ */
+export function applyToolBudget(messages: Message[], keepTokens = TOOL_BUDGET_KEEP_TOKENS): ToolBudgetResult {
+	let total = 0;
+	let split = messages.length;
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const message = messages[i];
+		if (!message) continue;
+		// No message is ever dropped here, only trimmed, so a call and its result
+		// can end up on opposite sides of the split without breaking the pairing
+		// the providers validate.
+		const next = total + estimateTokens(payloadText(message));
+		if (next > keepTokens) break;
+		total = next;
+		split = i;
+	}
+	if (split === 0) return { messages, trimmedCalls: 0, clearedResults: 0 };
+
+	let trimmedCalls = 0;
+	let clearedResults = 0;
+	let changed = false;
+	const out = messages.map((message, index) => {
+		if (index >= split) return message;
+		if (message.role === "toolResult") {
+			if (!message.content) return message;
+			clearedResults++;
+			changed = true;
+			return { ...message, content: OMITTED_RESULT };
+		}
+		if (message.role !== "assistant") return message;
+		let touched = false;
+		const content = message.content.map((c) => {
+			if (c.type !== "toolCall") return c;
+			const encoded = JSON.stringify(c.arguments);
+			if (encoded.length <= HISTORY_TOOL_ARG_MAX_CHARS) return c;
+			touched = true;
+			trimmedCalls++;
+			return { ...c, arguments: { _truncated: `${encoded.slice(0, HISTORY_TOOL_ARG_MAX_CHARS)}…`, _omittedChars: encoded.length - HISTORY_TOOL_ARG_MAX_CHARS } };
+		});
+		if (!touched) return message;
+		changed = true;
+		return { ...message, content };
+	});
+	if (!changed) return { messages, trimmedCalls: 0, clearedResults: 0 };
+	return { messages: out, trimmedCalls, clearedResults };
+}
+
+export function describeOversizeBody(bodyBytes: number, evictedImages: number): string {
+	const size = `${(bodyBytes / 1048576).toFixed(1)}MB`;
+	const omitted = evictedImages > 0 ? `已自动省略 ${evictedImages} 张旧配图，` : `图片已全部省略，`;
+	return `请求体过大（约 ${size}，网关拒绝 HTTP 413）。${omitted}仍超限：请新建工作项继续（推荐），或把对话回退到贴图之前，或换回包大小限制更宽松的接口；也可用 --max-image-bytes 调整图片预算。`;
 }
 
 /** Smallest reusable text helper used by adapters. */

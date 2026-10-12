@@ -2,7 +2,7 @@ import type { AssistantMessage, Message, Usage } from "../core/types.ts";
 import { EventStream } from "../core/event-stream.ts";
 import { normalizeReasoningEffort, type ReasoningEffort } from "../core/reasoning-effort.ts";
 import { readSse } from "./sse.ts";
-import { affinityHeaders, estimateTokens, fetchWithRetry, HttpError, parseJsonArguments, sanitizeMessages } from "./utils.ts";
+import { affinityHeaders, applyImageBudget, applyToolBudget, DEFAULT_MAX_IMAGE_BYTES, describeOversizeBody, estimateTokens, fetchWithRetry, HttpError, IMAGE_BUDGET_SHRINKS, MIN_IMAGE_BYTES, parseJsonArguments, sanitizeMessages, TEXT_HEADROOM_BYTES } from "./utils.ts";
 import type { Context, GroundEvent, ProviderAdapter, ProviderStreamOptions } from "./types.ts";
 
 type OpenAiChunk = {
@@ -30,9 +30,10 @@ type OpenAiChunk = {
 	error?: { message?: string; type?: string; code?: string | number } | string | null;
 };
 
-async function toOpenAiMessages(context: Context): Promise<unknown[]> {
+async function toOpenAiMessages(context: Context, imageBudget: number): Promise<{ messages: unknown[]; evicted: number }> {
 	const { resolveAttachment } = context;
-	const messages = sanitizeMessages(context.messages);
+	const budgeted = applyImageBudget(applyToolBudget(sanitizeMessages(context.messages)).messages, imageBudget);
+	const messages = budgeted.messages;
 	const out: unknown[] = [];
 	for (const m of messages) {
 		switch (m.role) {
@@ -101,7 +102,7 @@ async function toOpenAiMessages(context: Context): Promise<unknown[]> {
 				break;
 		}
 	}
-	return out;
+	return { messages: out, evicted: budgeted.evicted };
 }
 
 function buildTools(context: Context): unknown[] | undefined {
@@ -147,28 +148,59 @@ async function runStream(
 	}
 
 	const baseUrl = (options?.baseUrl ?? model.baseUrl ?? "https://api.openai.com/v1").replace(/\/$/, "");
-	const body: Record<string, unknown> = {
-		model: model.id,
-		messages: await toOpenAiMessages(context),
-		stream: true,
-		stream_options: { include_usage: true },
+	let imageBudget = options?.maxImageBytes ?? DEFAULT_MAX_IMAGE_BYTES;
+	if (!(imageBudget > 0)) imageBudget = DEFAULT_MAX_IMAGE_BYTES;
+	let evictedImages = 0;
+
+	const pushError = (errorMessage: string, stopReason: "error" | "aborted" = "error"): void => {
+		stream.push({
+			type: "error",
+			message: {
+				role: "assistant",
+				content: [],
+				api: "openai-completions",
+				provider: model.provider,
+				model: model.id,
+				usage: { input: 0, output: 0, totalTokens: 0 },
+				stopReason,
+				errorMessage,
+				timestamp: Date.now(),
+			},
+		});
+		stream.end();
 	};
-	const tools = buildTools(context);
-	if (tools?.length) body.tools = tools;
-	if (options?.maxTokens ?? model.maxTokens) body.max_tokens = options?.maxTokens ?? model.maxTokens;
-	if (options?.temperature !== undefined) body.temperature = options.temperature;
-	if (model.thinking) {
-		const effort = normalizeReasoningEffort(model.reasoningEffort) ?? "high";
-		// DeepSeek-compatible endpoints read the thinking switch from
-		// `reasoning_effort` itself (`none` disables it); `thinking` is mirrored
-		// for relays that only forward the type field.
-		body.thinking = { type: effort === "none" ? "disabled" : "enabled" };
-		body.reasoning_effort = effort;
-	}
 
 	try {
 		let started = false;
-		for (let attempt = 0; ; attempt++) {
+		let emptyRetried = false;
+		let shrinks = 0;
+		for (;;) {
+			const converted = await toOpenAiMessages(context, imageBudget);
+			evictedImages = converted.evicted;
+			const body: Record<string, unknown> = {
+				model: model.id,
+				messages: converted.messages,
+				stream: true,
+				stream_options: { include_usage: true },
+			};
+			const tools = buildTools(context);
+			if (tools?.length) body.tools = tools;
+			if (options?.maxTokens ?? model.maxTokens) body.max_tokens = options?.maxTokens ?? model.maxTokens;
+			if (options?.temperature !== undefined) body.temperature = options.temperature;
+			if (model.thinking) {
+				const effort = normalizeReasoningEffort(model.reasoningEffort) ?? "high";
+				// DeepSeek-compatible endpoints read the thinking switch from
+				// `reasoning_effort` itself (`none` disables it); `thinking` is mirrored
+				// for relays that only forward the type field.
+				body.thinking = { type: effort === "none" ? "disabled" : "enabled" };
+				body.reasoning_effort = effort;
+			}
+			const rawBody = JSON.stringify(body);
+			const bodyBytes = Buffer.byteLength(rawBody, "utf-8");
+			if (bodyBytes > imageBudget + TEXT_HEADROOM_BYTES) {
+				pushError(describeOversizeBody(bodyBytes, evictedImages));
+				return;
+			}
 			const response = await fetchWithRetry(
 				`${baseUrl}/chat/completions`,
 				{
@@ -178,15 +210,28 @@ async function runStream(
 						authorization: `Bearer ${apiKey}`,
 						...affinityHeaders(baseUrl, options?.sessionId),
 					},
-					body: JSON.stringify(body),
+					body: rawBody,
 					signal: options?.signal,
 				},
 				3,
 			);
 
 			if (!response.ok) {
+				if (
+					response.status === 413 &&
+					shrinks < IMAGE_BUDGET_SHRINKS &&
+					Math.floor(imageBudget / 2) >= MIN_IMAGE_BYTES
+				) {
+					shrinks++;
+					imageBudget = Math.floor(imageBudget / 2);
+					continue;
+				}
 				const errorBody = await response.text().catch(() => "");
-				throw new HttpError(`OpenAI API error ${response.status}: ${errorBody.slice(0, 500)}`, response.status, errorBody);
+				const message =
+					response.status === 413
+						? describeOversizeBody(bodyBytes, evictedImages)
+						: `OpenAI API error ${response.status}: ${errorBody.slice(0, 500)}`;
+				throw new HttpError(message, response.status, errorBody);
 			}
 
 			if (!started) {
@@ -332,7 +377,8 @@ async function runStream(
 			// message so the caller does not mistake it for model behavior.
 			const emptyAnomaly =
 				!aborted && !thinking && !text && toolCalls.size === 0 && inputTokens < EMPTY_COMPLETION_PROMPT_TOKENS;
-			if (emptyAnomaly && attempt === 0) {
+			if (emptyAnomaly && !emptyRetried) {
+				emptyRetried = true;
 				continue;
 			}
 

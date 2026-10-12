@@ -95,6 +95,12 @@ export interface UserMessage {
 	content: string;
 	/** Optional files (images) attached to this message for multimodal models. */
 	attachments?: Attachment[];
+	/**
+	 * True when this message was injected mid-run through {@link Agent.steer}
+	 * rather than starting a new run. The GUI relies on it to keep the whole run
+	 * as a single round, so the answer footer stays at the run's true end.
+	 */
+	steering?: boolean;
 	timestamp: number;
 }
 
@@ -163,8 +169,6 @@ export interface AgentTool<TParams extends z.ZodType = z.ZodTypeAny> {
 	label: string;
 	description: string;
 	parameters: TParams;
-	/** Short snippet contributed to the system prompt so the model knows how to use the tool. */
-	promptSnippet?: string;
 	execute: (args: ToolCallArgs, params: z.output<TParams>) => Promise<AgentToolResult>;
 }
 
@@ -228,6 +232,8 @@ export interface AgentLoopConfig {
 	apiKey?: string;
 	maxTokens?: number;
 	temperature?: number;
+	/** Cap on outbound image bytes per request. Older images are omitted past it. */
+	maxImageBytes?: number;
 	/** Stable per-conversation id forwarded to the provider adapter. */
 	sessionId?: string;
 	/**

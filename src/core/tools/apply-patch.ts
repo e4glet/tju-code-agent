@@ -82,7 +82,6 @@ export function createApplyPatchTool(cwd: string): AgentTool<typeof applyPatchSc
 		description:
 			"Apply a sequence of add / edit / delete file operations across one or more files in a single tool call. Operations apply in order; if one fails, the earlier operations remain applied and the error lists what succeeded. Each operation needs op ('add' | 'edit' | 'delete'); op may be omitted when the shape is unambiguous ({path, oldString, newString} defaults to edit, {path, content} to add, {path} alone to delete). Prefer this over repeated edit/write calls when changing multiple files at once.",
 		parameters: applyPatchSchema,
-		promptSnippet: "apply multiple file changes in one call",
 		async execute(_call, { operations }) {
 			const applied: string[] = [];
 			for (const op of operations) {

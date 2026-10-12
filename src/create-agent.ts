@@ -5,7 +5,7 @@ import { createAllTools } from "./core/tools/index.ts";
 import { createAskUserTool, type AskUserRequest } from "./core/tools/ask.ts";
 import { createTodoTool } from "./core/tools/todo.ts";
 import { createSubAgentTool } from "./core/tools/subagent.ts";
-import { DEFAULT_SYSTEM_PROMPT, modelFromConfig, type RunConfig } from "./config.ts";
+import { DEFAULT_SYSTEM_PROMPT, modelFromConfig, readProjectDocs, withProjectDocs, withWorkingDirectory, type RunConfig } from "./config.ts";
 
 export interface CreateAgentOptions extends Pick<AgentOptions, "beforeToolCall" | "afterToolCall"> {
 	config: RunConfig;
@@ -46,14 +46,19 @@ export function createAgent(options: CreateAgentOptions): Agent {
 	const { config, cwd } = options;
 	const todoStore: TodoStore = options.todoStore ?? { todos: [] };
 	const agentModel = modelFromConfig(config);
+	const docs = readProjectDocs(cwd);
 	const agent = new Agent({
 		model: agentModel,
-		systemPrompt: options.systemPrompt ?? DEFAULT_SYSTEM_PROMPT,
+		systemPrompt: withWorkingDirectory(
+			withProjectDocs(options.systemPrompt ?? DEFAULT_SYSTEM_PROMPT, docs),
+			cwd,
+		),
 		tools: [],
 		apiKey: config.apiKey,
 		provider: { model: agentModel, apiKey: config.apiKey, entryId: config.providerEntryId },
 		maxTokens: config.maxTokens,
 		maxContextTokens: config.maxContextTokens,
+		maxImageBytes: config.maxImageBytes,
 		maxTurns: config.maxTurns,
 		beforeToolCall: options.beforeToolCall,
 		afterToolCall: securityHintAfterToolCall(options.afterToolCall),

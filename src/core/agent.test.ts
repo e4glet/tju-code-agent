@@ -53,6 +53,23 @@ describe("Agent provider state", () => {
 	});
 });
 
+describe("Agent setSystemPrompt", () => {
+	it("replaces the prompt visible in state", () => {
+		const agent = new Agent({ model: BASE_MODEL, systemPrompt: "base" });
+		agent.setSystemPrompt("base\nCurrent working directory: D:\\new");
+		expect(agent.state.systemPrompt).toContain("D:\\new");
+	});
+});
+
+describe("Agent steer", () => {
+	it("marks injected messages so replay keeps the run as a single round", () => {
+		const agent = new Agent({ model: BASE_MODEL });
+		const injected: UserMessage = { role: "user", content: "补充说明", timestamp: 7 };
+		agent.steer(injected);
+		expect(injected.steering).toBe(true);
+	});
+});
+
 describe("Agent revertTo", () => {
 	const um = (timestamp: number, content: string): UserMessage => ({ role: "user", content, timestamp });
 

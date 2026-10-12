@@ -2,7 +2,7 @@ import { createServer, type Server } from "node:http";
 import { afterEach, describe, expect, it } from "vitest";
 import { z } from "zod";
 import { runAgentLoop, TURN_CAP_MARKER } from "./agent-loop.ts";
-import type { AgentContext, AgentEvent, AgentLoopConfig, AgentTool, Model } from "./types.ts";
+import type { AgentContext, AgentEvent, AgentLoopConfig, AgentTool, Attachment, Model } from "./types.ts";
 
 interface RecordedRequest {
 	body: {
@@ -181,6 +181,44 @@ describe("turn budget cap", () => {
 		expect(
 			(lastRequest?.body.messages ?? []).some((m) => m.content === "real question"),
 		).toBe(true);
+	});
+});
+
+describe("outbound image budget", () => {
+	it("omits older images past maxImageBytes without touching the transcript", async () => {
+		const requests: RecordedRequest[] = [];
+		const { server, port } = await startFakeProvider(requests, { toolCall: false });
+		servers.push(server);
+		const image = (id: string, name: string, size: number): Attachment => ({ id, name, mime: "image/png", size, kind: "image" });
+		const context: AgentContext = {
+			systemPrompt: "test",
+			messages: [
+				{ role: "user", content: "old", attachments: [image("a", "a-old.png", 600_000)], timestamp: 1 },
+				{ role: "user", content: "new", attachments: [image("b", "b-new.png", 600_000)], timestamp: 2 },
+			],
+			tools: [],
+			resolveAttachment: async () => new Uint8Array([1, 2, 3, 4]),
+		};
+		const config: AgentLoopConfig = {
+			model: {
+				id: "fake-model",
+				api: "openai-completions",
+				provider: "fake",
+				baseUrl: `http://127.0.0.1:${port}/v1`,
+				thinking: false,
+			},
+			apiKey: "fake-key",
+			tools: [],
+			maxImageBytes: 1_000_000,
+			maxTurns: 5,
+		};
+		await runAgentLoop([], context, config, undefined, () => {});
+		expect(requests).toHaveLength(1);
+		const sent = requests[0]!.body.messages ?? [];
+		expect(typeof sent[0]!.content).toBe("string");
+		expect(sent[0]!.content).toContain("a-old.png");
+		const stored = context.messages[0];
+		expect(stored?.role === "user" && stored.attachments?.length).toBe(1);
 	});
 });
 

@@ -4,7 +4,7 @@ import { readFile, readdir, stat } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { buildAgentTools, createAgent, type CreateAgentOptions } from "../create-agent.ts";
-import { PROVIDER_ENTRIES } from "../config.ts";
+import { PROVIDER_ENTRIES, readProjectDocs, withProjectDocs, withWorkingDirectory } from "../config.ts";
 import { describeDataRoot, resolveDataRoot } from "../data-root.ts";
 import {
 	deleteUserEntry,
@@ -362,6 +362,10 @@ export async function startGuiServer(config: RunConfig, flags: CliFlags): Promis
 		}
 		const gate = makeApprovalGate(checked.dir);
 		agent.setBeforeToolCall(gate);
+		const docs = await readProjectDocs(checked.dir);
+		agent.setSystemPrompt(
+			withWorkingDirectory(withProjectDocs(agent.state.systemPrompt, docs), checked.dir),
+		);
 		agent.setTools(
 			buildAgentTools(agent, {
 				cwd: checked.dir,

@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { applyPatchSchema } from "./apply-patch.ts";
-import { collapseQuotedNewlines, createBashTool, doubleLoopVariables, requoteSingles } from "./bash.ts";
+import { collapseQuotedNewlines, createBashTool, doubleLoopVariables, requoteSingles, windowsCommandHint } from "./bash.ts";
 import { createFetchTool, describeFetchError } from "./fetch.ts";
 import { createGrepTool } from "./grep.ts";
 import { createScanTool } from "./scan.ts";
@@ -256,6 +256,18 @@ describe("cmd.exe quoting normalisation", () => {
 			message = error instanceof Error ? error.message : String(error);
 		}
 		expect(message).toContain("does not exist in Windows cmd.exe");
+	});
+	it("points `| head` pipelines at glob/read instead of PowerShell transliteration", () => {
+		const piped = windowsCommandHint(255, "'head' is not recognized as an internal or external command", "dir /s /b . | head -n 200");
+		expect(piped).toContain("glob tool");
+		expect(piped).toContain("read tool");
+		expect(piped).not.toContain("Get-Content");
+		const pipedTail = windowsCommandHint(255, "'tail' is not recognized as an internal or external command", "dir /s /b . | tail -n 5");
+		expect(pipedTail).toContain("read tool");
+		// Bare `head <file>` still gets the file-slicing hint.
+		const bare = windowsCommandHint(9009, "'head' is not recognized as an internal or external command", "head big.txt");
+		expect(bare).toContain("read tool");
+		expect(bare).not.toContain("| head");
 	});
 });
 

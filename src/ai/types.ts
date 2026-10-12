@@ -31,6 +31,7 @@ export interface ProviderStreamOptions {
 	apiKey?: string;
 	baseUrl?: string;
 	maxTokens?: number;
+	maxImageBytes?: number;
 	temperature?: number;
 	signal?: AbortSignal;
 	/** Steering used by providers that support prompt caching/session affinity. */

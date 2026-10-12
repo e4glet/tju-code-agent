@@ -33,7 +33,6 @@ export function createAskUserTool(options: AskUserOptions): AgentTool<typeof ask
 		description:
 			"Ask the user a clarifying question when progress is genuinely blocked by a decision you cannot reasonably make yourself. Pass up to 3 suggested answers that are mutually exclusive and directly actionable; the user picks one or types their own. At most once per run — otherwise verify with tools and proceed with your best judgment.",
 		parameters: askUserSchema,
-		promptSnippet: "ask the user for a blocking decision",
 		async execute(call, { question, options: suggestions }) {
 			if (!options.canAsk()) {
 				return { content: ASK_LIMIT_MESSAGE, details: { limited: true } };

@@ -41,9 +41,8 @@ export function createReadTool(cwd: string): AgentTool<typeof readSchema> {
 		name: "read",
 		label: "read",
 		description:
-			"Read a text file. Returns the file content with line numbers. Optionally read only a slice of the file using offset and limit. Use glob to locate files by name before reading them.",
+			"Read a text file. Returns the file content with line numbers. Optionally read only a slice of the file using offset and limit. Use limit to read the first N lines (instead of `head`), offset to skip ahead (instead of `tail`). Use glob to locate files by name before reading them.",
 		parameters: readSchema,
-		promptSnippet: "read a file",
 		async execute(_ctx, { path, offset, limit }) {
 			const absolute = resolvePath(cwd, path);
 			await assertReadableFile(absolute);

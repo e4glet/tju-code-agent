@@ -34,13 +34,16 @@ const MAX_TRUNCATED_CAPTURE = 4 * 1024 * 1024; // drop after 4MB to bound memory
 const TRUNCATED_DIR_TTL_MS = 24 * 60 * 60 * 1000; // remove stale truncated-output dirs after 24h
 
 // Unix commands commonly used by models but absent in Windows cmd.exe. File
-// lookup and content search are covered by the glob/grep tools — prefer those
-// over shell equivalents so results stay structured and small.
+// lookup, content search and file slicing are covered by the glob/grep/read
+// tools — prefer those over shell equivalents so results stay structured and
+// small. This is also why `dir | head`-style pipelines are unnecessary: glob
+// caps at 100 matches (covers everyday projects) and read supports
+// offset/limit, so truncation lives inside the tools instead of Unix pipes.
 const WINDOWS_UNIX_HINTS: Record<string, string> = {
-	head: 'powershell -Command "Get-Content <file> -TotalCount <n>"',
-	tail: 'powershell -Command "Get-Content <file> -Tail <n>"',
+	head: 'use the read tool with limit (or Get-Content <file> -TotalCount <n> in PowerShell)',
+	tail: 'use the read tool with offset (or Get-Content <file> -Tail <n> in PowerShell)',
 	grep: "use the grep tool instead of findstr",
-	ls: "dir (or the glob tool to find files by name)",
+	ls: "use the glob tool to find files by name (or dir for a plain listing)",
 	cat: "use the read tool",
 	rm: "del <file>  (directories: rmdir /s /q <dir>)",
 	mv: "move <src> <dst>",
@@ -58,6 +61,12 @@ const WINDOWS_UNIX_HINTS: Record<string, string> = {
 
 const NOT_RECOGNIZED_RE = /'([^']+)' is not recognized as an internal or external command/i;
 const UNEXPECTED_RE = /was unexpected at this time/i;
+// `dir ... | head` / `... | tail` means "truncate piped output" — on Windows
+// that whole pipeline dies with exit 255 (bare `head` alone exits 9009) and
+// can even swallow later lines of the same .bat. Point the model at the
+// internal tools instead of a PowerShell transliteration.
+const PIPE_HEAD_RE = /\|\s*head\b/i;
+const PIPE_TAIL_RE = /\|\s*tail\b/i;
 
 // Only these mean "the command could not run at all" (missing binary, no
 // permission, broken batch syntax, killed). Any other non-zero exit —
@@ -164,8 +173,8 @@ function errorFooter(output: string): string {
 	return "The command produced no output, so the exit code is the only clue. Re-run with explicit output (echo markers, dir/type to confirm paths) instead of retrying blindly.";
 }
 
-/** Build a friendly hint when cmd.exe reports an unrecognized command (exit 9009). */
-function windowsCommandHint(exitCode: number | null, output: string): string | null {
+/** Build a friendly hint when cmd.exe reports an unrecognized command (exit 9009 bare, or 255 when inside a pipeline). Exported for unit tests. */
+export function windowsCommandHint(exitCode: number | null, output: string, command?: string): string | null {
 	if (UNEXPECTED_RE.test(output)) {
 		return (
 			"HINT: this is a cmd.exe batch parsing error (the command runs inside a temporary .bat file, " +
@@ -189,6 +198,19 @@ function windowsCommandHint(exitCode: number | null, output: string): string | n
 		);
 	}
 	const alt = WINDOWS_UNIX_HINTS[name.toLowerCase()];
+	// Pipe truncation (`dir ... | head`, `... | tail`) is the common case:
+	// point at the internal tools, not at another shell one-liner.
+	const lower = name.toLowerCase();
+	if (command && (lower === 'head' || lower === 'tail')) {
+		const isPipe = lower === 'head' ? PIPE_HEAD_RE.test(command) : PIPE_TAIL_RE.test(command);
+		if (isPipe) {
+			const toolHint =
+				lower === 'head'
+					? 'This `| head` pipeline only wanted the first lines of output — use the glob tool to list files (capped at 100 matches, enough for everyday projects) or the read tool with limit to read the first lines of a file.'
+					: 'This `| tail` pipeline only wanted the last lines of output — use the read tool with offset to read the tail of a file.';
+			return `HINT: '${name}' is a Unix command and does not exist in Windows cmd.exe. ${toolHint}`;
+		}
+	}
 	const suffix = alt ? ` On Windows cmd.exe use: ${alt}` : "";
 	return (
 		`HINT: '${name}' is a Unix command and does not exist in Windows cmd.exe.${suffix}` +
@@ -274,11 +296,10 @@ export function createBashTool(cwd: string, options: BashToolOptions = {}): Agen
 		description:
 			`Execute a shell command in ${workdir}. Returns stdout/stderr. Output is truncated when very large. ` +
 			(isWindows
-				? "On Windows this runs cmd.exe, so use Windows syntax (mkdir, not mkdir -p). "
-				: "") +
+				? "On Windows this runs cmd.exe, so use Windows syntax (mkdir, not mkdir -p). Never pipe into Unix tools (head/tail/grep/cat/ls/find): use the glob tool to list files (capped at 100 matches), the grep tool to search contents, and the read tool with offset/limit to slice files. "
+				: "Prefer the glob/grep/read tools over shell pipes (cat/grep/head) for file lookup, search, and slicing. ") +
 			"Supports an optional timeout in seconds. Never use interactive commands or pagers (more, pause, bare python/node prompts).",
 		parameters: bashSchema,
-		promptSnippet: "execute a shell command (this tool runs locally)",
 		async execute(call: ToolCallArgs, input: BashInput) {
 			const interactive = matchInteractiveCommand(input.command);
 			if (interactive) {
@@ -367,7 +388,7 @@ export function createBashTool(cwd: string, options: BashToolOptions = {}): Agen
 				throw new Error(`${header}\nCommand timed out after ${input.timeout ?? 0} seconds.\n${errBody}`);
 			}
 			if (exitCode !== 0 && isFatalExit(exitCode, output, isWindows)) {
-				const hint = isWindows ? windowsCommandHint(exitCode, output) : null;
+				const hint = isWindows ? windowsCommandHint(exitCode, output, input.command) : null;
 				const footer = errorFooter(output);
 				throw new Error(`${header}\nCommand exited with code ${exitCode}.\n${errBody}${hint ? `\n${hint}` : ""}${footer ? `\n${footer}` : ""}`);
 			}

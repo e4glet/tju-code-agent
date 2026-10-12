@@ -16,7 +16,6 @@ export function createWriteTool(cwd: string): AgentTool<typeof writeSchema> {
 		description:
 			"Write the given content to a file, creating parent directories. Overwrites existing content. Use edit() for small targeted changes.",
 		parameters: writeSchema,
-		promptSnippet: "write a file",
 		async execute(_call, { path, content }) {
 			const absolute = resolvePath(cwd, path);
 			await ensureParentDir(absolute);

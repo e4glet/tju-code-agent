@@ -38,9 +38,8 @@ export function createGlobTool(cwd: string): AgentTool<typeof globSchema> {
 		name: "glob",
 		label: "glob",
 		description:
-			"Find files by name pattern without reading them. Each match includes the file size in bytes, so use this to locate files and to check file sizes instead of shell for-loops. Use grep to search inside file contents.",
+			"Find files by name pattern without reading them. Each match includes the file size in bytes, so use this to locate files and to check file sizes instead of shell for-loops. Use this instead of `dir /s /b ... | head` or `ls ... | head` pipelines: results are capped at 100 matches (enough for everyday projects) with a narrowing hint when truncated. Use grep to search inside file contents.",
 		parameters: globSchema,
-		promptSnippet: "find files by name",
 		async execute(call, { pattern, path }) {
 			const root = path ? (isAbsolute(path) ? path : resolve(cwd, path)) : cwd;
 			const matchNameOnly = !pattern.includes("/");
