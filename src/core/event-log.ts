@@ -47,6 +47,10 @@ export class EventLog {
 	private readonly dir: string;
 	private readonly startTs = Date.now();
 	private seq = 0;
+	/** Highest sequence number written so far; lets the GUI dedupe a live replay. */
+	get lastSeq(): number {
+		return this.seq;
+	}
 	private pending: string[] = [];
 	private flushTimer: ReturnType<typeof setTimeout> | null = null;
 	private flushing: Promise<void> | null = null;
@@ -118,7 +122,15 @@ export class EventLog {
 			this.flushTimer = null;
 		}
 		this.endTs = Date.now();
-		await this.flush();
+		// A flush already in flight returns its own promise without splicing the
+		// entries appended after it started, so awaiting `flush()` once can leave
+		// the final message_end / turn_end / agent_end permanently unwritten (the
+		// meta sidecar would still record them — a silent data loss). Drain until
+		// both the in-flight write and the buffer are empty; `finalized` above
+		// stops any new appends, so this always terminates.
+		while (this.flushing || this.pending.length) {
+			await this.flush();
+		}
 		const meta = this.meta();
 		await writeFile(this.metaPath, JSON.stringify(meta), "utf-8");
 		return meta;
@@ -235,6 +247,17 @@ class SegmentAccumulator {
 	private readonly toolOpen = new Map<string, { off: number; ts: number }>();
 	private readonly msgOpen: Array<{ role: "user" | "assistant"; off: number; ts: number }> = [];
 	private readonly segs: RunSegment[] = [];
+	// Meta counts folded in the same pass as the segments, so a cached summary
+	// costs one traversal of the JSONL rather than one for meta plus one for
+	// segments.
+	turnCount = 0;
+	toolCount = 0;
+	messageCount = 0;
+	prompt = "";
+
+	get startTs(): number | null {
+		return this.base;
+	}
 
 	push(entry: LogEntry): void {
 		if (this.base === null) this.base = entry.ts;
@@ -242,13 +265,21 @@ class SegmentAccumulator {
 		const base = this.base;
 		const event = entry.event;
 		switch (event.type) {
+			case "turn_start": {
+				this.turnCount++;
+				break;
+			}
 			case "message_start": {
 				const role = event.message.role === "user" ? "user" : "assistant";
 				this.msgOpen.push({ role, off: entry.ts - base, ts: entry.ts });
+				if (!this.prompt && role === "user" && typeof event.message.content === "string") {
+					this.prompt = event.message.content.slice(0, 160);
+				}
 				break;
 			}
 			case "message_end": {
 				const role = event.message.role === "user" ? "user" : "assistant";
+				this.messageCount++;
 				const idx = this.msgOpen.findIndex((m) => m.role === role);
 				if (idx >= 0) {
 					const open = this.msgOpen.splice(idx, 1)[0]!;
@@ -257,6 +288,7 @@ class SegmentAccumulator {
 				break;
 			}
 			case "tool_start": {
+				this.toolCount++;
 				this.toolOpen.set(event.toolCallId, { off: entry.ts - base, ts: entry.ts });
 				break;
 			}
@@ -306,14 +338,118 @@ export interface RunSummary extends RunMeta {
 	bytes: number;
 }
 
+/** Everything one streaming pass over a run's JSONL yields. */
+export interface RunFacts {
+	segments: RunSegment[];
+	turnCount: number;
+	toolCount: number;
+	messageCount: number;
+	prompt?: string;
+	startTs: number;
+}
+
+/**
+ * Fold one run's events into its timeline segments and meta counts in a single
+ * streaming pass. Memory-friendly for large runs (the JSONL is never held whole).
+ */
+export async function deriveRunFactsStream(dir: string, runId: string): Promise<RunFacts> {
+	const acc = new SegmentAccumulator();
+	for await (const entry of readRunEventsStream(dir, runId)) acc.push(entry);
+	return {
+		segments: acc.finish(),
+		turnCount: acc.turnCount,
+		toolCount: acc.toolCount,
+		messageCount: acc.messageCount,
+		prompt: acc.prompt || undefined,
+		startTs: acc.startTs ?? Date.now(),
+	};
+}
+
+/**
+ * Per-run summary cache. Re-reading every JSONL on every `/api/runs` call made
+ * that route block the single-threaded server for seconds once the log dir grew
+ * (measured ~17 s for 40 runs / 1.2 GB), and the GUI hits it on page load, on
+ * `agent_start` and on `agent_end`. A run's summary is reused until its files'
+ * size/mtime actually change, so only the run being appended to is recomputed.
+ */
+interface RunSummaryCacheEntry {
+	stamp: string;
+	summary: RunSummary;
+}
+const summaryCache = new Map<string, RunSummaryCacheEntry>();
+/** In-flight rebuilds, so concurrent callers share one pass instead of racing. */
+const summaryInFlight = new Map<string, Promise<RunSummary>>();
+
+const CACHE_KEY_SEP = "\u0000";
+const cacheKey = (dir: string, runId: string): string => `${dir}${CACHE_KEY_SEP}${runId}`;
+
+/** Size+mtime of a run's files; any change invalidates its cached summary. */
+async function runStamp(dir: string, runId: string): Promise<string> {
+	let stamp = "";
+	for (const name of runFileNames(runId)) {
+		const st = await stat(join(dir, name)).catch(() => null);
+		stamp += st ? `${st.mtimeMs}:${st.size}|` : "-|";
+	}
+	return stamp;
+}
+
+async function computeRunSummary(dir: string, runId: string): Promise<RunSummary> {
+	const meta = await readRunMeta(dir, runId);
+	const facts = await deriveRunFactsStream(dir, runId);
+	const bytes = await runBytes(dir, runId);
+	if (meta) return { ...meta, segments: facts.segments, bytes };
+	return {
+		runId,
+		startTs: facts.startTs,
+		endTs: null,
+		model: "",
+		prompt: facts.prompt,
+		turnCount: facts.turnCount,
+		toolCount: facts.toolCount,
+		messageCount: facts.messageCount,
+		segments: facts.segments,
+		bytes,
+	};
+}
+
+function getRunSummary(dir: string, runId: string): Promise<RunSummary> {
+	const key = cacheKey(dir, runId);
+	const running = summaryInFlight.get(key);
+	if (running) return running;
+	const task = (async () => {
+		const stamp = await runStamp(dir, runId);
+		const cached = summaryCache.get(key);
+		if (cached && cached.stamp === stamp) return cached.summary;
+		const summary = await computeRunSummary(dir, runId);
+		summaryCache.set(key, { stamp, summary });
+		return summary;
+	})().finally(() => {
+		summaryInFlight.delete(key);
+	});
+	summaryInFlight.set(key, task);
+	return task;
+}
+
 /** List recorded runs newest first, each annotated with compact timeline segments. */
 export async function summarizeRuns(dir: string): Promise<RunSummary[]> {
-	const metas = await listRuns(dir);
-	const out: RunSummary[] = [];
-	for (const meta of metas) {
-		out.push({ ...meta, segments: await deriveSegmentsStream(dir, meta.runId), bytes: await runBytes(dir, meta.runId) });
+	const names = await readdir(dir).catch(() => []);
+	const runIds = new Set<string>();
+	for (const name of names) {
+		if (name.endsWith(".jsonl")) runIds.add(name.slice(0, -".jsonl".length));
+		else if (name.endsWith(".meta.json")) runIds.add(name.slice(0, -".meta.json".length));
 	}
-	return out;
+
+	// Forget runs that no longer exist so a long-lived process cannot leak.
+	const prefix = `${dir}${CACHE_KEY_SEP}`;
+	for (const key of summaryCache.keys()) {
+		if (key.startsWith(prefix) && !runIds.has(key.slice(prefix.length))) summaryCache.delete(key);
+	}
+
+	const summaries = await Promise.all(
+		[...runIds].filter(isSafeRunId).map((runId) => getRunSummary(dir, runId)),
+	);
+	summaries.sort((a, b) => b.startTs - a.startTs);
+	return summaries;
 }
 
 /** List recorded runs newest first, preferring sidecar metadata. */

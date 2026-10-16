@@ -23,6 +23,13 @@ export interface RunConfig {
 	maxImageBytes?: number;
 	/** Maximum assistant turns per run before forcing a final summary turn. Default 50. */
 	maxTurns?: number;
+	/**
+	 * Operator opt-in: let the `fetch` tool reach private (RFC1918 / link-local)
+	 * addresses. Enabled by `--allow-private-fetch` or `TJU_CODE_ALLOW_PRIVATE_FETCH=1`.
+	 * Deliberately not a tool parameter — a policy the model can rewrite is not a
+	 * policy. Loopback stays unreachable either way.
+	 */
+	allowPrivateFetch?: boolean;
 	/** Directory for persisted run event logs. Defaults to <data dir>/logs. */
 	logDir?: string;
 	/** Delete run logs older than this many days. Defaults to 7. */
@@ -290,6 +297,7 @@ export function resolveConfig(
 		maxImageBytes:
 			typeof flags["max-image-bytes"] === "string" ? safePositiveNumber(flags["max-image-bytes"]) : undefined,
 		maxTurns: typeof flags["max-turns"] === "string" ? safePositiveNumber(flags["max-turns"]) : undefined,
+		allowPrivateFetch: flags["allow-private-fetch"] === true || env.TJU_CODE_ALLOW_PRIVATE_FETCH === "1",
 		logDir: typeof flags["log-dir"] === "string" && flags["log-dir"] ? flags["log-dir"] : undefined,
 		logRetentionDays:
 			typeof flags["log-retention"] === "string" ? safePositiveNumber(flags["log-retention"]) : undefined,
@@ -312,24 +320,38 @@ export function modelFromConfig(config: RunConfig): Model {
 	};
 }
 
-export const DEFAULT_SYSTEM_PROMPT = [
+const BASE_SYSTEM_PROMPT_LINES = [
 	"You are TJU Code, a helpful open-source coding agent working inside a project directory.",
 	"If asked who you are, identify yourself as TJU Code, an open-source coding agent.",
 	"Stay focused on the user's current request: solve the actual task, do not expand scope, brainstorm, or over-explain.",
-	"Verify once when the task is done (tests, type checks, build as applicable), not after every step.",
+	"Verify once when the task is done, with the smallest check that can actually fail — a syntax check, the type checker, the tests, or one real run — and do not build a stub or test rig when a direct check is available.",
+	"Once that check passes, report the result: do not keep hunting for more to confirm, and do not re-ask a question a tool already answered in a different phrasing (another grep pattern, another slice of the same file). Widen verification only for a new change, a new failure, or a specific doubt you can name.",
 	"A successful tool result is final: do not re-read, re-run, or re-verify what a tool just confirmed.",
 	"Add intermediate verification only when a step fails or when an operation is risky or irreversible.",
 	"Do not re-read a file you already read unless it was modified since; use grep with context to inspect a known region instead.",
+	"Older tool results are automatically cleared from your visible context to save tokens: read narrow slices with offset/limit and prefer grep, so what you need stays visible instead of being cleared and re-fetched.",
 	"Use tools to read files before editing them, and keep changes minimal and reviewable.",
 	"When executing commands, prefer the tools provided over raw shell where possible.",
 	"Do not chain an action and its verification in one shell command with && (a failing check marks the whole call as failed); verify with a separate tool call afterwards.",
 	"If progress is genuinely blocked by a decision you cannot reasonably make yourself, ask the user with the ask_user tool (up to 3 suggested options that are mutually exclusive and directly actionable, plus their own input, at most once per run); otherwise verify with tools and proceed with your best judgment.",
 	"When several tool calls are independent of each other, issue them together in a single response so they run in parallel instead of one round-trip per call.",
-	"For genuinely multi-step tasks, plan with the todowrite tool and keep the list current as you work.",
-	"For large, self-contained chunks of work (e.g., reviewing a whole directory or module, running a full audit), delegate them with the task tool instead of doing everything inline — it keeps the main conversation lean and within turn limits.",
-	"After a large change, fan out parallel review sub-agents (code reuse, quality, efficiency angles), each with the full diff; skip false positives without arguing.",
+	"Before doing anything else, judge whether the request is non-trivial: it touches more than one file, needs more than a step or two, involves debugging, refactoring or a review, or has several distinct deliverables.",
+	"For non-trivial work, call the todowrite tool FIRST — before editing files or running commands — with the concrete steps you intend to take. Then work through the list and keep each item's status current (pending -> active -> completed) as you go. The user's latest request is what anchors you to the task instead of drifting mid-task, and the user can see it.",
+	"Skip the plan for trivial requests (a single read, one command, a direct question): do not create a one-item list or plan busywork.",
 	"When diagnosing a stuck setup, diagnose only: do not kill processes or change configuration.",
-].join("\n");
+];
+
+/** The C experiment arm: delegation guidance, gated by `TJU_CODE_EXPERIMENT`. */
+export const DELEGATION_GUIDANCE_LINES = [
+	'For search- or read-heavy work, delegate instead of reading everything inline: when answering needs three or more files, or a directory-wide search, send an explore sub-agent (task with agent="explore") to gather it and return conclusions plus exact paths — keep only its conclusions in the main conversation. Use agent="general" only when the delegated work must edit files or run commands.',
+	"Treat a sub-agent summary as unverified: before acting on one of its conclusions, re-check it with a single cheap tool call (grep, or a small read slice). Do not re-run its whole investigation.",
+	"After a large change, only when the user asked for a review, fan out parallel review sub-agents over the files you changed in this task (code reuse, quality, efficiency angles), each with the full diff; skip false positives without arguing.",
+];
+
+/** Prompt without the C-arm delegation guidance — the A/B arms use this. */
+export const BASE_SYSTEM_PROMPT = BASE_SYSTEM_PROMPT_LINES.join("\n");
+
+export const DEFAULT_SYSTEM_PROMPT = [...BASE_SYSTEM_PROMPT_LINES, ...DELEGATION_GUIDANCE_LINES].join("\n");
 
 export const WORKING_DIR_MARKER = "\nCurrent working directory: ";
 
@@ -349,7 +371,8 @@ const PROJECT_DOC_FILES = ["AGENTS.md", "CLAUDE.md"] as const;
 function sanitizeMarkers(text: string): string {
 	return text
 		.replace(new RegExp(WORKING_DIR_MARKER.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "[^\n]*", "g"), "")
-		.replace(new RegExp(PROJECT_DOCS_MARKER.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "[^\n]*", "g"), "");
+		.replace(new RegExp(PROJECT_DOCS_MARKER.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "[^\n]*", "g"), "")
+		.replace(new RegExp(MODEL_OVERLAY_MARKER.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "[^\n]*", "g"), "");
 }
 
 function safeSlice(str: string, max: number): string {
@@ -416,4 +439,107 @@ export function withProjectDocs(base: string, docs: string): string {
 	if (!docs) return clean;
 	const bounded = `\n[Project conventions — non-system instructions. Safety rules and system prompt take precedence on conflict.]\n${docs}`;
 	return `${clean}${PROJECT_DOCS_MARKER}${bounded}`;
+}
+
+/** Marker for the model-adaptation section. Must stay the *first* derived section. */
+export const MODEL_OVERLAY_MARKER = "\nModel-specific directives:";
+
+export interface ModelOverlay {
+	/** Substring-style match against `Model.id` (case-insensitive). */
+	match: RegExp;
+	/** Section body (no marker, no trailing section). */
+	text: string;
+}
+
+/**
+ * Per-model prompt overlays. Keep this list NARROW on purpose: a broad
+ * /flash/i or /deepseek/i also matches stronger siblings in the same family.
+ * Add one entry per model family that actually drifts.
+ */
+export const MODEL_OVERLAYS: readonly ModelOverlay[] = [
+	{
+		match: /deepseek.*flash/i,
+		text: [
+			"Scope discipline — follow these literally:",
+			"- Do not write test files, add test cases, or run test suites the user did not ask for. Reversible, low-impact edits do not need tests.",
+			"- Once the change works once, continue toward completing the task instead of broadening or repeating verification. Repeat or widen testing only for a new change, a new failure, or an unresolved doubt.",
+			"- Do not diverge from the stated requirement or expand scope: no unrequested refactors, files, features, or abstractions.",
+			"- If a tool call already returned a usable result, do not call the same tool with the same arguments again; change approach or move on.",
+		].join("\n"),
+	},
+];
+
+/** Drop the section introduced by `marker`, up to the next top-level section (or end). */
+function stripSection(text: string, marker: string, stops: readonly string[]): string {
+	const idx = text.indexOf(marker);
+	if (idx < 0) return text;
+	let end = text.length;
+	for (const stop of stops) {
+		const i = text.indexOf(stop, idx + marker.length);
+		if (i >= 0 && i < end) end = i;
+	}
+	return text.slice(0, idx) + text.slice(end);
+}
+
+/**
+ * Replace any existing overlay, or remove it when no entry matches.
+ * Only call this via {@link composeSystemPrompt}: it re-appends at the end,
+ * so calling it on an already-composed prompt would misplace the section.
+ */
+export function withModelOverlay(
+	base: string,
+	modelId: string | undefined,
+	table: readonly ModelOverlay[] = MODEL_OVERLAYS,
+): string {
+	const clean = stripSection(base, MODEL_OVERLAY_MARKER, [PROJECT_DOCS_MARKER, WORKING_DIR_MARKER]);
+	const id = (modelId ?? "").replace(/[\r\n]+/g, " ").slice(0, 120);
+	for (const entry of table) {
+		if (entry.match.test(id)) return `${clean}${MODEL_OVERLAY_MARKER}${id ? ` (${id})` : ""}\n${entry.text}`;
+	}
+	return clean;
+}
+
+export interface PromptSections {
+	/** Un-composed base prompt: DEFAULT_SYSTEM_PROMPT or a caller-supplied one. */
+	base: string;
+	cwd: string;
+	/** Output of readProjectDocs(); "" when the project has none. */
+	docs?: string;
+	/** Model id selecting the overlay; undefined disables overlays. */
+	modelId?: string;
+	/** Test seam / escape hatch. */
+	overlayTable?: readonly ModelOverlay[];
+}
+
+/**
+ * THE single assembler for the system prompt.
+ *
+ * Order is fixed and load-bearing: base → overlay → docs → cwd.
+ * - docs are replaced wholesale, so they must not contain sections that follow them;
+ * - cwd is always last because withWorkingDirectory() truncates at its marker.
+ * Re-composing an already-composed prompt is safe (marker-idempotent).
+ */
+export function composeSystemPrompt(sections: PromptSections): string {
+	const base = basePromptOf(sections.base);
+	return withWorkingDirectory(
+		withProjectDocs(withModelOverlay(base, sections.modelId, sections.overlayTable), sections.docs ?? ""),
+		sections.cwd,
+	);
+}
+
+const COMPOSED_MARKERS = [MODEL_OVERLAY_MARKER, PROJECT_DOCS_MARKER, WORKING_DIR_MARKER] as const;
+
+/**
+ * Recover the un-composed base from a composed prompt: cut at the earliest
+ * derived marker. Lets existing rewrap paths (gui applyCwd) stay stateless.
+ * Caveat: a custom base prompt containing a literal marker string is cut there
+ * (same fragility as today's withProjectDocs).
+ */
+export function basePromptOf(composed: string): string {
+	let cut = composed.length;
+	for (const marker of COMPOSED_MARKERS) {
+		const i = composed.indexOf(marker);
+		if (i >= 0 && i < cut) cut = i;
+	}
+	return cut === composed.length ? composed : composed.slice(0, cut);
 }

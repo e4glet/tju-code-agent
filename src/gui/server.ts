@@ -4,7 +4,7 @@ import { readFile, readdir, stat } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { buildAgentTools, createAgent, type CreateAgentOptions } from "../create-agent.ts";
-import { PROVIDER_ENTRIES, readProjectDocs, withProjectDocs, withWorkingDirectory } from "../config.ts";
+import { PROVIDER_ENTRIES, readProjectDocs } from "../config.ts";
 import { describeDataRoot, resolveDataRoot } from "../data-root.ts";
 import {
 	deleteUserEntry,
@@ -43,7 +43,136 @@ import {
 interface SseClient {
 	res: ServerResponse;
 	close: () => void;
+	/** Frames held back because the socket is backed up (or a replay is draining). */
+	queue: SseQueueState;
+	/** Set once `res.write()` reports a full buffer; cleared when the queue drains. */
+	paused: boolean;
+	/** True while this client's replay backlog is still being written out. */
+	replaying: boolean;
 }
+
+/**
+ * Frames buffered for one client while its socket is backed up.
+ * `bytes` is the sum of `frames[i].json.length`, maintained incrementally.
+ */
+export interface SseQueueState {
+	frames: SseFrame[];
+	bytes: number;
+}
+
+/** One SSE frame plus whether it may be dropped when a client falls behind. */
+export interface SseFrame {
+	json: string;
+	coalescible: boolean;
+	/**
+	 * Run-log sequence number of the event this frame carries, when it has one.
+	 * Used to drop live frames that a concurrent replay already delivered.
+	 */
+	seq?: number;
+}
+
+/**
+ * Whether a payload's frame is safe to drop under backpressure. Only streaming
+ * deltas are: the next `message_update` supersedes this one and `message_end`
+ * carries the finished message. Decided structurally from the payload we built —
+ * never by scanning the JSON text, which a model could imitate.
+ */
+export function isCoalesciblePayload(payload: unknown): boolean {
+	const p = payload as { kind?: unknown; event?: { type?: unknown } } | null;
+	return !!p && p.kind === "event" && !!p.event && p.event.type === "message_update";
+}
+
+/** Run-log sequence carried by a payload, when it has one (see `SseFrame.seq`). */
+export function payloadSeq(payload: unknown): number | undefined {
+	const seq = (payload as { seq?: unknown } | null)?.seq;
+	return typeof seq === "number" ? seq : undefined;
+}
+
+/**
+ * Whether a queued live frame was already delivered by the replay that ran while
+ * it was buffered. Frames without a sequence (state, works, approvals) are never
+ * suppressed — they are not part of the run log.
+ */
+export function shouldSuppressFrame(frame: SseFrame, suppressThroughSeq: number): boolean {
+	return frame.seq !== undefined && frame.seq <= suppressThroughSeq;
+}
+
+/**
+ * Drop the live frames a just-finished replay already delivered.
+ *
+ * Applied exactly once, to the frames buffered during that replay — never as a
+ * standing sequence watermark, because the next run restarts its sequence at 1
+ * and a lingering watermark would silently drop its early events.
+ */
+export function dropReplayedDuplicates(state: SseQueueState, replayMaxSeq: number): void {
+	if (!state.frames.length) return;
+	const keep = state.frames.filter((frame) => !shouldSuppressFrame(frame, replayMaxSeq));
+	if (keep.length === state.frames.length) return;
+	state.bytes = keep.reduce((total, frame) => total + frame.json.length, 0);
+	state.frames = keep;
+}
+
+/**
+ * Buffer one frame for a client whose socket is backed up.
+ *
+ * Evicts coalescible frames while the queue is over either cap, so a browser
+ * that stops reading cannot make the server buffer without bound (a single
+ * `agent_end` frame reached 1.1 MB). Returns false when the queue holds nothing
+ * droppable — the caller should drop that client so it reconnects and replays
+ * from the log instead of the server growing indefinitely.
+ */
+export function enqueueFrame(state: SseQueueState, frame: SseFrame, maxBytes: number, maxFrames: number): boolean {
+	while (state.frames.length >= maxFrames || state.bytes + frame.json.length > maxBytes) {
+		let dropped = false;
+		for (let i = state.frames.length - 1; i >= 0; i--) {
+			const queued = state.frames[i]!;
+			if (queued.coalescible) {
+				state.bytes -= queued.json.length;
+				state.frames.splice(i, 1);
+				dropped = true;
+				break;
+			}
+		}
+		if (!dropped) return false;
+	}
+	state.frames.push(frame);
+	state.bytes += frame.json.length;
+	return true;
+}
+
+/**
+ * Write a chunk, resolving only once the socket has room again. When the buffer
+ * is already full `write()` returns false and we wait for `'drain'`, which is
+ * what keeps a large replay (hundreds of MB) from being buffered whole in the
+ * server's memory while the browser is slow to read.
+ */
+export function writeOrWait(res: Pick<ServerResponse, "write" | "once">, chunk: string): Promise<void> {
+	return new Promise((resolve) => {
+		if (res.write(chunk)) {
+			resolve();
+			return;
+		}
+		res.once("drain", () => resolve());
+	});
+}
+
+/**
+ * Cadence of SSE comment frames. Any byte on the wire keeps intermediaries from
+ * reaping an idle stream and lets both ends notice a half-open socket: the
+ * browser resets its idle watchdog on each frame, the server's next write to a
+ * dead socket throws and reclaims the client.
+ */
+const SSE_HEARTBEAT_MS = 15_000;
+
+/**
+ * Per-client backpressure ceiling. A browser that stops reading must not make
+ * the server buffer without bound (a single `agent_end` frame reached 1.1 MB);
+ * past this the oldest coalescible `message_update` frames are dropped, and a
+ * client whose queue is all essential frames is dropped so it can reconnect and
+ * replay instead.
+ */
+const MAX_CLIENT_QUEUE_BYTES = 8 * 1024 * 1024;
+const MAX_CLIENT_QUEUE_FRAMES = 2000;
 
 export interface GuiServerOptions {
 	config: RunConfig;
@@ -218,57 +347,28 @@ export async function startGuiServer(config: RunConfig, flags: CliFlags): Promis
 	};
 
 	const pluginsDir = join(cwd, "plugins");
-	const pluginRelDirs: string[] = [];
-	let pluginTags = "";
-	const pluginNames: string[] = [];
 
 	// Plugin scripts run in the GUI's own origin and can therefore read the
 	// session token and drive the agent (approve directory access, exfiltrate the
 	// transcript). The plugin directory lives in the agent's writable workspace,
-	// so "auto-load whatever is on disk" would turn any file write — including one
-	// done under prompt injection — into code execution in this origin. Hence the
-	// allowlist is computed once, at startup, from the directories present then:
-	// adding a plugin requires a restart, which the CLI announces below.
-	const scanPlugins = async (): Promise<Set<string>> => {
-		const allowed = new Set<string>();
-		let entries;
-		try {
-			entries = await readdir(pluginsDir, { withFileTypes: true });
-		} catch {
-			return allowed; // no plugins dir, skip
-		}
-		for (const entry of entries) {
-			if (!entry.isDirectory()) continue;
-			if (entry.name.startsWith(".") || entry.name.includes("..")) continue;
-			const relDir = entry.name;
-			try {
-				const info = await stat(join(pluginsDir, relDir, ENTRY_FILE));
-				if (!info.isFile()) continue;
-			} catch {
-				continue; // no entry file, skip
-			}
-			// Every file inside the plugin directory is enumerable by the route
-			// below, so the allowlist covers the whole tree, not just the entry.
-			for (const rel of await listPluginFiles(relDir)) {
-				allowed.add(`${relDir}/${rel}`);
-			}
-			pluginRelDirs.push(relDir);
-			pluginNames.push(relDir);
-			// `relDir` comes from the filesystem, so it is escaped before being
-			// embedded in HTML:
-			// a directory name may legally contain `"` on Linux/macOS, which
-			// would otherwise close the attribute and inject markup.
-			const src = `/plugins/${relDir.split("/").map(encodeURIComponent).join("/")}/${ENTRY_FILE}`;
-			pluginTags += `<script src="${escHtml(src)}"></script>\n`;
-		}
-		return allowed;
-	};
-
-	// Only plugin files that already existed when the process started are served,
-	// and never after the process exits: the agent has write access to the
-	// workspace, so a plugin written mid-session must not become executable in
-	// the GUI origin without the user restarting and thus re-consenting.
-	const allowedPluginFiles = await scanPlugins();
+	// so "auto-load whatever is on disk" would turn any file write — including
+	// one done under prompt injection — into code execution in this origin.
+	// Hence the allowlist is computed exactly once, at startup, from the
+	// directories present then: adding a plugin requires a restart, which the CLI
+	// announces below. Scanning once (and binding the results, not accumulating
+	// into shared arrays) is what keeps a mid-session write from becoming
+	// executable without the user's restart-and-consent.
+	const pluginScan = await scanPluginDirs(pluginsDir);
+	const allowedPluginFiles = pluginScan.allowed;
+	const pluginNames = pluginScan.names;
+	let pluginTags = "";
+	for (const relDir of pluginNames) {
+		// `relDir` comes from the filesystem, so it is escaped before being
+		// embedded in HTML: a directory name may legally contain `"` on
+		// Linux/macOS, which would otherwise close the attribute and inject markup.
+		const src = `/plugins/${relDir.split("/").map(encodeURIComponent).join("/")}/${ENTRY_FILE}`;
+		pluginTags += `<script src="${escHtml(src)}"></script>\n`;
+	}
 
 	const moduleDir = dirname(fileURLToPath(import.meta.url));
 	const makeAssetLoader = (fileName: string) => {
@@ -292,16 +392,52 @@ export async function startGuiServer(config: RunConfig, flags: CliFlags): Promis
 	const loadFavicon = makeAssetLoader("favicon.ico");
 	const loadLogo = makeAssetLoader("logo-2026.png");
 
-	const broadcast = (payload: unknown): void => {
-		const json = `data: ${JSON.stringify(payload)}\n\n`;
-		for (const client of clients) {
+	const closeClient = (client: SseClient): void => {
+		client.close();
+		clients.delete(client);
+	};
+
+	const enqueueForClient = (client: SseClient, frame: SseFrame): void => {
+		if (!enqueueFrame(client.queue, frame, MAX_CLIENT_QUEUE_BYTES, MAX_CLIENT_QUEUE_FRAMES)) {
+			closeClient(client);
+		}
+	};
+
+	const flushClientQueue = (client: SseClient): void => {
+		while (client.queue.frames.length) {
+			const frame = client.queue.frames.shift()!;
+			client.queue.bytes -= frame.json.length;
 			try {
-				client.res.write(json);
+				// A `false` return still accepted the chunk (Node buffered it); stop
+				// here and resume on the next 'drain'.
+				if (!client.res.write(frame.json)) return;
 			} catch {
-				client.close();
-				clients.delete(client);
+				closeClient(client);
+				return;
 			}
 		}
+		client.paused = false;
+	};
+
+	const sendToClient = (client: SseClient, frame: SseFrame): void => {
+		if (client.paused || client.replaying) {
+			enqueueForClient(client, frame);
+			return;
+		}
+		try {
+			if (!client.res.write(frame.json)) client.paused = true;
+		} catch {
+			closeClient(client);
+		}
+	};
+
+	const broadcast = (payload: unknown): void => {
+		const frame: SseFrame = {
+			json: `data: ${JSON.stringify(payload)}\n\n`,
+			coalescible: isCoalesciblePayload(payload),
+			seq: payloadSeq(payload),
+		};
+		for (const client of [...clients]) sendToClient(client, frame);
 	};
 
 	const makeApprovalGate = (dir: string): NonNullable<CreateAgentOptions["beforeToolCall"]> =>
@@ -363,13 +499,12 @@ export async function startGuiServer(config: RunConfig, flags: CliFlags): Promis
 		const gate = makeApprovalGate(checked.dir);
 		agent.setBeforeToolCall(gate);
 		const docs = await readProjectDocs(checked.dir);
-		agent.setSystemPrompt(
-			withWorkingDirectory(withProjectDocs(agent.state.systemPrompt, docs), checked.dir),
-		);
+		agent.setPromptSections({ base: agent.promptBase, cwd: checked.dir, docs });
 		agent.setTools(
 			buildAgentTools(agent, {
 				cwd: checked.dir,
 				maxTokens: config.maxTokens,
+				allowPrivateFetch: config.allowPrivateFetch,
 				todoStore: workTodos,
 				beforeToolCall: gate,
 				askUser: askUserHandler,
@@ -378,25 +513,25 @@ export async function startGuiServer(config: RunConfig, flags: CliFlags): Promis
 		activeCwd = checked.dir;
 	};
 
-	agent.subscribe(async (event) => {
-		broadcast({ kind: "event", runId: currentRunId, event });
-	});
-
+	// One subscriber, not two: the event must be durably sequenced (written to the
+	// run log) *before* it is broadcast, so the frame can carry its `seq` and a
+	// client that reconnects mid-run can tell which replayed frames are already
+	// covered. Broadcasting first would leave the GUI unable to dedupe.
 	agent.subscribe(async (event) => {
 		if (event.type === "agent_start") {
 			if (activeLog) await activeLog.finalize();
 			currentRunId = makeRunId();
 			activeLog = await EventLog.create({ dir: logDir, runId: currentRunId, model: agent.state.model.id });
+		}
+		let seq: number | undefined;
+		if (activeLog) {
 			await activeLog.append(event);
-			return;
+			seq = activeLog.lastSeq;
+			if (event.type === "turn_end") scheduleWorkSave();
 		}
-		if (!activeLog) return;
-		await activeLog.append(event);
-		if (event.type === "turn_end") {
-			scheduleWorkSave();
-		}
+		broadcast({ kind: "event", runId: currentRunId, seq, event });
 		if (event.type === "agent_end") {
-			await activeLog.finalize();
+			if (activeLog) await activeLog.finalize();
 			activeLog = null;
 			await flushWorkSave();
 			broadcast({ kind: "works" });
@@ -451,7 +586,6 @@ export async function startGuiServer(config: RunConfig, flags: CliFlags): Promis
 		await sessionStore.setLastActive(currentWorkId);
 	};
 	await restoreStartupWork();
-	await scanPlugins();
 
 	const server = createServer(async (req, res) => {
 		const url = new URL(req.url ?? "/", "http://localhost");
@@ -527,14 +661,14 @@ export async function startGuiServer(config: RunConfig, flags: CliFlags): Promis
 				return;
 			}
 
-			// The one route reachable without the token header: `<img src>` cannot
-			// set headers, so it authenticates with a short-lived ticket instead.
-			// It has to be exempted *here*, before the generic token check, or the
-			// request would be rejected as unauthorized and never reach its handler.
+			// Routes reachable without the token header: `<img src>` and
+			// `EventSource` cannot set headers, so they authenticate with a
+			// short-lived ticket instead. This has to be exempted *here*, before the
+			// generic token check, or the request would be rejected as unauthorized
+			// and never reach its handler.
+			const ticketRoute = pathname.startsWith("/api/attachments/") || pathname === "/api/events";
 			const isTicketOnlyRequest =
-				req.method === "GET" &&
-				pathname.startsWith("/api/attachments/") &&
-				isTicketAuthorized(req, url.searchParams.get("t"));
+				req.method === "GET" && ticketRoute && isTicketAuthorized(req, url.searchParams.get("t"));
 
 			if (pathname.startsWith("/api/") && !isAuthorized(req) && !isTicketOnlyRequest) {
 				writeJson(res, 403, { error: "Forbidden" });
@@ -548,6 +682,7 @@ export async function startGuiServer(config: RunConfig, flags: CliFlags): Promis
 					connection: "keep-alive",
 					...SECURITY_HEADERS,
 				});
+				res.flushHeaders();
 				await activeLog?.flush();
 				res.write(": connected\n\n");
 				const initialWork = currentWorkId ? await sessionStore.load(currentWorkId) : null;
@@ -562,32 +697,69 @@ export async function startGuiServer(config: RunConfig, flags: CliFlags): Promis
 						work: initialWork ? { id: initialWork.id, title: initialWork.title, messages: initialWork.messages } : null,
 					})}\n\n`,
 				);
-				if (currentRunId) {
-					for await (const entry of readRunEventsStream(logDir, currentRunId)) {
-						res.write(`data: ${JSON.stringify({ kind: "replay", runId: entry.runId, event: entry.event })}\n\n`);
+
+				const heartbeat = setInterval(() => {
+					try {
+						res.write(`: ping ${Date.now()}\n\n`);
+					} catch {
+						clearInterval(heartbeat);
 					}
-				}
-				// A refresh while the run waits on the user would otherwise lose
-				// the prompt with no way to get it back: re-issue anything still
-				// pending so the reconnected page can answer it.
-				for (const [, pending] of pendingApprovals) {
-					res.write(`data: ${JSON.stringify({ kind: "approval", request: pending.request })}\n\n`);
-				}
-				for (const [, pending] of pendingQuestions) {
-					res.write(`data: ${JSON.stringify({ kind: "question", request: pending.request })}\n\n`);
-				}
+				}, SSE_HEARTBEAT_MS);
 				const client: SseClient = {
 					res,
 					close: () => {
+						clearInterval(heartbeat);
 						try {
 							res.end();
 						} catch {
 							// ignore
 						}
 					},
+					queue: { frames: [], bytes: 0 },
+					paused: false,
+					// While true, live broadcasts are buffered instead of written,
+					// so they cannot interleave with the replay backlog below.
+					replaying: !!currentRunId,
 				};
+				res.on("drain", () => {
+					if (!client.replaying) flushClientQueue(client);
+				});
+				// Register *before* the replay. Otherwise every event produced during
+				// the replay window (which can be seconds for a large run) is
+				// broadcast to nobody and lost forever — including `agent_end`, which
+				// is what left the UI stuck on "executing" until a manual refresh.
 				clients.add(client);
-				req.on("close", () => clients.delete(client));
+				req.on("close", () => {
+					clearInterval(heartbeat);
+					clients.delete(client);
+				});
+
+				// A refresh while the run waits on the user would otherwise lose
+				// the prompt with no way to get it back: re-issue anything still
+				// pending so the reconnected page can answer it (before the replay,
+				// so a long backlog does not delay the prompt).
+				for (const [, pending] of pendingApprovals) {
+					await writeOrWait(res, `data: ${JSON.stringify({ kind: "approval", request: pending.request })}\n\n`);
+				}
+				for (const [, pending] of pendingQuestions) {
+					await writeOrWait(res, `data: ${JSON.stringify({ kind: "question", request: pending.request })}\n\n`);
+				}
+
+				let replayMaxSeq = 0;
+				if (currentRunId) {
+					for await (const entry of readRunEventsStream(logDir, currentRunId)) {
+						if (entry.seq > replayMaxSeq) replayMaxSeq = entry.seq;
+						await writeOrWait(
+							res,
+							`data: ${JSON.stringify({ kind: "replay", runId: entry.runId, seq: entry.seq, event: entry.event })}\n\n`,
+						);
+					}
+				}
+				// Live frames buffered during the replay that it already delivered
+				// must not be applied twice. Applied once, to this replay's buffer.
+				dropReplayedDuplicates(client.queue, replayMaxSeq);
+				client.replaying = false;
+				flushClientQueue(client);
 				return;
 			}
 
@@ -849,6 +1021,14 @@ export async function startGuiServer(config: RunConfig, flags: CliFlags): Promis
 				} else {
 					writeJson(res, 400, { error: `Invalid effort: ${String(body.effort)}` });
 				}
+				return;
+			}
+
+			if (pathname === "/api/prune" && req.method === "POST") {
+				const body = await readBody(req);
+				const keep = typeof body.keep === "number" && Number.isFinite(body.keep) ? Math.floor(body.keep) : 0;
+				agent.setPruneFoldedKeep(keep > 0 ? keep : undefined);
+				writeJson(res, 200, { ok: true, pruneFoldedKeep: keep > 0 ? keep : 0 });
 				return;
 			}
 
@@ -1158,25 +1338,34 @@ export async function startGuiServer(config: RunConfig, flags: CliFlags): Promis
 					return;
 				}
 				const id = makeWorkId();
-				const requested = resolved.dir && !sameDir(resolved.dir, activeCwd) ? resolved.dir : null;
+				// The directory picked in the creation dialog takes effect immediately. The
+				// old flow parked it in `pendingCwd` and saved the *previous* directory as
+				// the item's cwd, so a fresh item started in the wrong place and the agent
+				// then asked for permission to the directory the user had just chosen
+				// (bug 1 of 0.1.15.6). A blank field keeps the *current* work directory —
+				// which is what the GUI shows as the placeholder — instead of whatever
+				// directory the process happened to start in.
+				const target = resolved.dir ?? activeCwd;
 				await sessionStore.save({
 					id,
 					title: title || "未命名工作项",
-					cwd: requested ? cwd : (resolved.dir ?? cwd),
+					cwd: target,
 					model: agent.state.model,
 					messages: [],
 					todos: [],
 					createdAt: Date.now(),
 					updatedAt: Date.now(),
 				});
-				if (requested) pendingCwd.set(id, { dir: requested, until: Date.now() + CWD_PENDING_TTL_MS });
 				if (agent.streaming) {
+					// A run is in flight and its tools were built for the current directory,
+					// so the switch happens when the item is opened (openWork → applyCwd);
+					// the item keeps `cwd: target` until then.
 					broadcast({ kind: "works" });
-					writeJson(res, 200, requested ? { ok: true, id, switched: false, pending: true, cwd: requested } : { ok: true, id, switched: false });
+					writeJson(res, 200, { ok: true, id, switched: false, cwd: target });
 					return;
 				}
 				await openWork(id);
-				writeJson(res, 200, requested ? { ok: true, id, switched: true, pending: true, cwd: requested } : { ok: true, id, switched: true });
+				writeJson(res, 200, { ok: true, id, switched: true, cwd: target });
 				return;
 			}
 
@@ -1325,6 +1514,15 @@ export async function startGuiServer(config: RunConfig, flags: CliFlags): Promis
 		}
 	});
 
+	// SSE responses are long-lived by design, so Node's defaults (a 300 s
+	// request timeout, a 5 s keep-alive window) would tear an idle stream down
+	// mid-run — including while a tool is legitimately quiet for minutes. The
+	// keep-alive window sits just above the heartbeat cadence so a healthy
+	// stream is never reaped, while headersTimeout must exceed it.
+	server.requestTimeout = 0;
+	server.keepAliveTimeout = 65_000;
+	server.headersTimeout = 70_000;
+
 	await new Promise<void>((resolve, reject) => {
 		let retries = 10;
 		const onError = (err: unknown): void => {
@@ -1344,13 +1542,13 @@ export async function startGuiServer(config: RunConfig, flags: CliFlags): Promis
 	});
 
 	try {
-		process.title = `Tju code v${APP_VERSION}`;
+		process.title = `TJU Code v${APP_VERSION}`;
 	} catch {
 		// title is cosmetic only
 	}
 
 	const url = `http://127.0.0.1:${port}`;
-	console.log(`tju-code GUI: ${url}`);
+	console.log(`TJU Code GUI: ${url}`);
 	console.log(`Model: ${config.api} / ${config.model}`);
 	console.log(`Session token: ${token} (required for /api/* requests)`);
 	if (pluginNames.length > 0) {
@@ -1449,6 +1647,55 @@ const SECURITY_HEADERS: Record<string, string> = {
 	"referrer-policy": "no-referrer",
 	"x-frame-options": "DENY",
 };
+
+/** Recursive file listing of one plugin directory, as paths relative to it. */
+/** One plugin directory's files, as paths relative to `pluginsDir` (e.g. "pet/assets/a.webp"). */
+export interface PluginScanResult {
+	/** Every servable file under every plugin that has an entry file. */
+	allowed: Set<string>;
+	/** Plugin directory names, in scan order, deduplicated by construction. */
+	names: string[];
+}
+
+/**
+ * Enumerate the plugin directories present at startup into a flat allowlist of
+ * paths relative to `pluginsDir` (e.g. "pet/pet.js").
+ *
+ * Paths are resolved against `pluginsDir`, never against `process.cwd()`: when
+ * the GUI runs from a directory other than the plugin root, a relative base
+ * lists nothing and every plugin request 404s. A directory without the entry
+ * file, or a hidden one, is skipped. Call this exactly once per process — the
+ * allowlist is the security boundary, so a plugin written while the process
+ * runs must not become executable without a restart.
+ */
+export async function scanPluginDirs(pluginsDir: string): Promise<PluginScanResult> {
+	const allowed = new Set<string>();
+	const names: string[] = [];
+	let entries;
+	try {
+		entries = await readdir(pluginsDir, { withFileTypes: true });
+	} catch {
+		return { allowed, names }; // no plugins dir, skip
+	}
+	for (const entry of entries) {
+		if (!entry.isDirectory()) continue;
+		if (entry.name.startsWith(".") || entry.name.includes("..")) continue;
+		const relDir = entry.name;
+		try {
+			const info = await stat(join(pluginsDir, relDir, ENTRY_FILE));
+			if (!info.isFile()) continue;
+		} catch {
+			continue; // no entry file, skip
+		}
+		// Every file inside the plugin directory is enumerable by the route
+		// below, so the allowlist covers the whole tree, not just the entry.
+		for (const rel of await listPluginFiles(join(pluginsDir, relDir))) {
+			allowed.add(`${relDir}/${rel}`);
+		}
+		names.push(relDir);
+	}
+	return { allowed, names };
+}
 
 /** Recursive file listing of one plugin directory, as paths relative to it. */
 async function listPluginFiles(pluginDir: string, rel = "", out: string[] = []): Promise<string[]> {

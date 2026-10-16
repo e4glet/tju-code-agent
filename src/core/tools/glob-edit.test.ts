@@ -89,6 +89,16 @@ describe("glob tool", () => {
 		const res = await run(createGlobTool(root), { pattern: "*.txt" });
 		expect(res.content).toContain("more than 100 matches");
 	});
+	it("refuses search roots outside the working directory", async () => {
+		const root = freshDir();
+		seedTree(root);
+		const outside = freshDir();
+		writeFileSync(join(outside, "evil.ts"), "x\n");
+		const abs = await run(createGlobTool(root), { pattern: "*.ts", path: outside });
+		expect(abs.content).toContain("超出当前工作目录");
+		const rel = await run(createGlobTool(root), { pattern: "*.ts", path: ".." });
+		expect(rel.content).toContain("超出当前工作目录");
+	});
 });
 
 describe("edit whitespace-insensitive fallback", () => {

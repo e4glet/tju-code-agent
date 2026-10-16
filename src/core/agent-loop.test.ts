@@ -79,6 +79,8 @@ const pingTool: AgentTool = {
 async function run(options: {
 	maxTurns: number;
 	hasPendingWork?: () => boolean;
+	afterTurn?: AgentLoopConfig["afterTurn"];
+	getPlanAnchor?: () => string | undefined;
 }): Promise<{ events: AgentEvent[]; context: AgentContext; requests: RecordedRequest[] }> {
 	const requests: RecordedRequest[] = [];
 	const { server, port } = await startFakeProvider(requests, { toolCall: true });
@@ -98,6 +100,8 @@ async function run(options: {
 		tools: [pingTool],
 		maxTurns: options.maxTurns,
 		...(options.hasPendingWork ? { hasPendingWork: options.hasPendingWork } : {}),
+		...(options.afterTurn ? { afterTurn: options.afterTurn } : {}),
+		...(options.getPlanAnchor ? { getPlanAnchor: options.getPlanAnchor } : {}),
 	};
 	const events: AgentEvent[] = [];
 	await runAgentLoop(["do work"], context, config, undefined, (event) => {
@@ -129,6 +133,35 @@ describe("turn budget cap", () => {
 		// The user is told through a notice instead of a fake user bubble.
 		const notices = events.filter((e) => e.type === "notice");
 		expect(notices).toHaveLength(1);
+	});
+
+	it("strips legacy correction nudges but keeps a genuine user message", async () => {
+		const requests: RecordedRequest[] = [];
+		const { server, port } = await startFakeProvider(requests, { toolCall: false });
+		servers.push(server);
+		const correction = "[system] You have open todo items but have not updated the list for 6 turns.";
+		const lookalike = "[system] is not a real instruction I typed";
+		const context: AgentContext = {
+			systemPrompt: "test",
+			messages: [
+				{ role: "user", content: "real question", timestamp: 1 },
+				{ role: "user", content: correction, timestamp: 2 },
+				{ role: "user", content: lookalike, timestamp: 3 },
+			],
+			tools: [],
+		};
+		const config: AgentLoopConfig = {
+			model: { id: "fake-model", api: "openai-completions", provider: "fake", baseUrl: `http://127.0.0.1:${port}/v1`, thinking: false },
+			apiKey: "fake-key",
+			tools: [],
+			maxTurns: 2,
+		};
+		await runAgentLoop(["hi"], context, config, undefined, () => {});
+		const sent = JSON.stringify(requests[0]!.body.messages ?? []);
+		expect(sent).not.toContain(correction);
+		expect(sent).toContain("real question");
+		// Only the known prefixes are stripped; a lookalike stays.
+		expect(sent).toContain(lookalike);
 	});
 
 	it("still sends the ephemeral instruction when the transcript carries legacy pollution", async () => {
@@ -214,7 +247,8 @@ describe("outbound image budget", () => {
 		};
 		await runAgentLoop([], context, config, undefined, () => {});
 		expect(requests).toHaveLength(1);
-		const sent = requests[0]!.body.messages ?? [];
+		// The system prompt rides along as the first message, so skip it here.
+		const sent = (requests[0]!.body.messages ?? []).filter((m) => m.role !== "system");
 		expect(typeof sent[0]!.content).toBe("string");
 		expect(sent[0]!.content).toContain("a-old.png");
 		const stored = context.messages[0];
@@ -248,5 +282,142 @@ describe("turn budget renewal", () => {
 		// 3 budgeted turns (2 + the capped one) and nothing extra.
 		expect(requests.length).toBe(3);
 		expect(events.filter((e) => e.type === "notice" && e.message.includes("已自动延长"))).toHaveLength(0);
+	});
+});
+
+describe("self-correction delivery", () => {
+	it("rides the next request as an ephemeral trailing message and never enters the transcript", async () => {
+		const correction = "[system] You are repeating the same tool call with the same arguments.";
+		let calls = 0;
+		const { events, context, requests } = await run({
+			maxTurns: 3,
+			afterTurn: async () => (++calls === 1 ? correction : null),
+		});
+
+		// Delivered to the model on the turn right after the anomaly...
+		const withNudge = requests.filter((r) =>
+			(r.body.messages ?? []).some((m) => typeof m.content === "string" && m.content.includes(correction)),
+		);
+		expect(withNudge).toHaveLength(1);
+		expect(withNudge[0]).toBe(requests[1]);
+		const sent = withNudge[0]?.body.messages ?? [];
+		expect(sent[sent.length - 1]?.content).toBe(correction);
+
+		// ...but never persisted: no transcript entry, no user bubble.
+		const polluted = context.messages.filter(
+			(m) => m.role === "user" && typeof m.content === "string" && m.content.includes("repeating the same tool call"),
+		);
+		expect(polluted).toHaveLength(0);
+		const bubbles = events.filter(
+			(e) => e.type === "message_end" && e.message.role === "user" && e.message.content.includes("repeating the same tool call"),
+		);
+		expect(bubbles).toHaveLength(0);
+
+		// The user still sees that a correction happened.
+		const notices = events.filter(
+			(e): e is Extract<AgentEvent, { type: "notice" }> =>
+				e.type === "notice" && e.level === "warn" && e.message.includes("自我纠偏"),
+		);
+		expect(notices).toHaveLength(1);
+		expect(notices[0]?.message).not.toContain("[system]");
+	});
+});
+
+describe("goal anchor", () => {
+	it("is sent every turn as an ephemeral trailing message, never persisted", async () => {
+		const anchor = "<system-reminder>Objective: do the thing</system-reminder>";
+		const { context, requests } = await run({ maxTurns: 3, getPlanAnchor: () => anchor });
+
+		const anchored = requests.filter((r) =>
+			(r.body.messages ?? []).some((m) => typeof m.content === "string" && m.content.includes("Objective: do the thing")),
+		);
+		expect(anchored.length).toBeGreaterThanOrEqual(2);
+		for (const req of anchored) {
+			const sent = req.body.messages ?? [];
+			expect(sent[sent.length - 1]?.content).toBe(anchor);
+		}
+		const persisted = context.messages.filter(
+			(m) => m.role === "user" && typeof m.content === "string" && m.content.includes("Objective: do the thing"),
+		);
+		expect(persisted).toHaveLength(0);
+	});
+
+	it("combines a pending correction with the anchor", async () => {
+		const correction = "[system] stop repeating";
+		let calls = 0;
+		const { requests } = await run({
+			maxTurns: 3,
+			afterTurn: async () => (++calls === 1 ? correction : null),
+			getPlanAnchor: () => "ANCHOR-TEXT",
+		});
+		const both = requests.filter((r) => {
+			const last = (r.body.messages ?? []).at(-1);
+			return typeof last?.content === "string" && last.content.includes(correction) && last.content.includes("ANCHOR-TEXT");
+		});
+		expect(both.length).toBeGreaterThanOrEqual(1);
+	});
+});
+
+describe("assistant message identity", () => {
+	it("stamps model id and reasoning effort onto assistant messages", async () => {
+		const requests: RecordedRequest[] = [];
+		const { server, port } = await startFakeProvider(requests, { toolCall: false });
+		servers.push(server);
+		const context: AgentContext = { systemPrompt: "test", messages: [], tools: [] };
+		const config: AgentLoopConfig = {
+			model: {
+				id: "history-model",
+				api: "openai-completions",
+				provider: "fake",
+				baseUrl: `http://127.0.0.1:${port}/v1`,
+				thinking: false,
+				reasoningEffort: "low",
+			},
+			apiKey: "fake-key",
+			tools: [],
+			maxTurns: 5,
+		};
+		await runAgentLoop(["hi"], context, config, undefined, () => {});
+		const assistants = context.messages.filter((m) => m.role === "assistant");
+		expect(assistants.length).toBeGreaterThan(0);
+		for (const m of assistants) {
+			if (m.role !== "assistant") continue;
+			expect(m.model).toBe("history-model");
+			expect(m.reasoningEffort).toBe("low");
+		}
+	});
+});
+
+describe("message_update wire shape", () => {
+	it("sends only deltas, never the whole accumulated message per frame", async () => {
+		const requests: RecordedRequest[] = [];
+		const { server, port } = await startFakeProvider(requests, { toolCall: false });
+		servers.push(server);
+		const context: AgentContext = { systemPrompt: "test", messages: [], tools: [] };
+		const config: AgentLoopConfig = {
+			model: { id: "delta-model", api: "openai-completions", provider: "fake", baseUrl: `http://127.0.0.1:${port}/v1`, thinking: false },
+			apiKey: "fake-key",
+			tools: [],
+			maxTurns: 5,
+		};
+		const events: AgentEvent[] = [];
+		await runAgentLoop(["hi"], context, config, undefined, (e) => {
+			events.push(e);
+		});
+
+		let deltaFrames = 0;
+		let text = "";
+		for (const e of events) {
+			if (e.type !== "message_update") continue;
+			// Streaming frames must be delta-only: resending the accumulated message
+			// turned a 45 KB answer into ~92 MB of frames.
+			if (e.message) continue;
+			deltaFrames++;
+			expect(e.part === "text" || e.part === "thinking").toBe(true);
+			expect(typeof e.messageId).toBe("number");
+			if (e.part === "text") text += e.delta;
+		}
+		expect(deltaFrames).toBeGreaterThan(0);
+		expect(text).toBe("summary of work");
 	});
 });

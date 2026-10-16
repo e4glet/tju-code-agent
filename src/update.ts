@@ -292,7 +292,7 @@ export const RELAUNCH_ARGV_ENV = "TJU_CODE_RELAUNCH_ARGV";
  * would be split at the space and fail with "找不到文件 'C:\Program'".
  */
 export function buildWindowsRelaunchArgs(exe: string, cli: string): string[] {
-	return ["/d", "/s", "/c", "start", "Tju code", exe, cli];
+	return ["/d", "/s", "/c", "start", "TJU Code", exe, cli];
 }
 
 /**

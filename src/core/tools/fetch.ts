@@ -22,17 +22,19 @@ export const fetchSchema = z.object({
 		.positive()
 		.optional()
 		.describe("Optional timeout in seconds (default 30)"),
-	allowPrivate: z
-		.boolean()
-		.optional()
-		.describe(
-			"Allow requests to private/link-local addresses (disabled by default for SSRF safety). " +
-				"Loopback targets are never allowed through this tool; use bash instead. " +
-				"Only set true when the target is a local or internal service you intend to reach.",
-		),
 });
 
 export type FetchInput = z.infer<typeof fetchSchema>;
+
+export interface FetchToolOptions {
+	/**
+	 * Deployment-level switch: allow requests to private (RFC1918 / link-local)
+	 * addresses. Set by the operator (`--allow-private-fetch`), never by the
+	 * model — a policy the governed party can rewrite is not a policy. Loopback
+	 * is refused regardless of this flag.
+	 */
+	allowPrivate?: boolean;
+}
 
 function errorCauseChain(error: unknown): string {
 	const parts: string[] = [];
@@ -347,16 +349,18 @@ async function readLimited(response: Response, limit: number): Promise<Uint8Arra
 	return out;
 }
 
-export function createFetchTool(): AgentTool<typeof fetchSchema> {
+export function createFetchTool(options: FetchToolOptions = {}): AgentTool<typeof fetchSchema> {
+	const allowPrivate = options.allowPrivate === true;
 	return {
 		name: "fetch",
 		label: "fetch",
 		description:
 			"Fetch a web page or API endpoint over http(s) and return its text content. " +
 			"Follows redirects. Limits response size to protect context. " +
-			"Use for reading online documentation, checking API responses or scraping simple pages.",
+			"Use for reading online documentation, checking API responses or scraping simple pages. " +
+			"Private/internal addresses are refused unless the operator enabled them at launch; loopback is never reachable through this tool (use bash for local services).",
 		parameters: fetchSchema,
-		async execute(call, { url, maxBytes, timeout, allowPrivate }) {
+		async execute(call, { url, maxBytes, timeout }) {
 			let parsed: URL;
 			try {
 				parsed = new URL(url);

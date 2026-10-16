@@ -182,3 +182,132 @@ describe("bash loopback guard", () => {
 		expect(seen).toHaveLength(3);
 	});
 });
+
+describe("bash directory traversal guard", () => {
+	it("prompts for an out-of-workdir cd target", async () => {
+		const work = freshDir();
+		const outside = freshDir();
+		const seen: string[] = [];
+		const gate = createApprovalGate({
+			workdir: work,
+			ask: async (request) => {
+				seen.push(request.scopeDir);
+				return false;
+			},
+		});
+		const blocked = await gate(bashCall("t1", `cd /d ${outside} && dir /b`));
+		expect(blocked?.block).toBe(true);
+		expect(seen.length).toBeGreaterThan(0);
+	});
+
+	it("prompts for a relative cd that escapes the workdir", async () => {
+		const work = freshDir();
+		const seen: string[] = [];
+		const gate = createApprovalGate({
+			workdir: work,
+			ask: async (request) => {
+				seen.push(request.scopeDir);
+				return false;
+			},
+		});
+		const blocked = await gate(bashCall("t1", "cd ..\\.. && dir /b"));
+		expect(blocked?.block).toBe(true);
+		expect(seen.length).toBeGreaterThan(0);
+	});
+
+	it("prompts for dot-dot search fragments after an in-workdir cd", async () => {
+		const work = freshDir();
+		mkdirSync(join(work, "a", "b"), { recursive: true });
+		const seen: string[] = [];
+		const gate = createApprovalGate({
+			workdir: work,
+			ask: async (request) => {
+				seen.push(request.scopeDir);
+				return false;
+			},
+		});
+		const blocked = await gate(bashCall("t1", "cd a\\b && findstr /s /n foo ..\\..\\..\\*.md"));
+		expect(blocked?.block).toBe(true);
+		expect(seen.length).toBeGreaterThan(0);
+	});
+
+	it("stays silent for in-workdir cd and plain commands", async () => {
+		const work = freshDir();
+		mkdirSync(join(work, "sub"));
+		let asks = 0;
+		const gate = createApprovalGate({
+			workdir: work,
+			ask: async () => {
+				asks++;
+				return true;
+			},
+		});
+		expect(await gate(bashCall("t1", "dir /b"))).toBeUndefined();
+		expect(await gate(bashCall("t2", "cd sub && dir /b"))).toBeUndefined();
+		expect(await gate(bashCall("t3", "type .\\sub\\f.txt"))).toBeUndefined();
+		expect(asks).toBe(0);
+	});
+});
+
+describe("bash volume-root guard", () => {
+	it("prompts for a bare drive root, in every spelling", async () => {
+		if (process.platform !== "win32") return;
+		const work = freshDir();
+		const root = parse(work).root; // e.g. "D:\\"
+		const drive = root.slice(0, 2); // e.g. "D:"
+		const seen: ApprovalRequest[] = [];
+		const gate = createApprovalGate({
+			workdir: work,
+			ask: async (request) => {
+				seen.push(request);
+				return true;
+			},
+		});
+		// `dir /s /b D:\` walks the whole drive: the pattern used to require at
+		// least one character after the separator, so it produced no candidate.
+		await gate(bashCall("t1", `dir /s /b ${root}`));
+		await gate(bashCall("t2", `dir ${root}`));
+		await gate(bashCall("t3", `dir ${drive}`));
+		expect(seen).toHaveLength(3);
+		for (const request of seen) {
+			expect(request.scopeDir).toBe(root);
+			expect(request.parentDir).toBeNull();
+		}
+	});
+
+	it("reads a drive-relative cd target as that drive's root and never remembers it", async () => {
+		if (process.platform !== "win32") return;
+		const work = freshDir();
+		const root = parse(work).root;
+		const drive = root.slice(0, 2);
+		const seen: ApprovalRequest[] = [];
+		const gate = createApprovalGate({
+			workdir: work,
+			ask: async (request) => {
+				seen.push(request);
+				return "always" as const;
+			},
+		});
+		await gate(bashCall("t1", `cd /d ${drive} && dir /b`));
+		expect(seen).toHaveLength(1);
+		expect(seen[0]?.scopeDir).toBe(root);
+		expect(seen[0]?.via).toContain("cd 目标");
+		// A root grant is never remembered, so the next command asks again.
+		await gate(bashCall("t2", `dir ${drive}`));
+		expect(seen).toHaveLength(2);
+	});
+
+	it("does not read a host or protocol colon as a drive", async () => {
+		const work = freshDir();
+		const seen: ApprovalRequest[] = [];
+		const gate = createApprovalGate({
+			workdir: work,
+			ask: async (request) => {
+				seen.push(request);
+				return false;
+			},
+		});
+		await gate(bashCall("t1", "curl http://127.0.0.1:9399/api/version"));
+		expect(seen.map((r) => r.path)).toEqual(["http://127.0.0.1:9399"]);
+	});
+});

@@ -107,25 +107,27 @@ export function compressTranscript(
 	const out = tidied.slice();
 	let guard = 0;
 	while (transcriptTokens(out) > maxContextTokens && out.length > KEEP_MESSAGES_MIN && guard++ < 1000) {
-		// Drop whole turns to keep the transcript a valid user/assistant/toolResult
-		// sequence. Turns are bounded by user messages: pick the oldest removable
-		// user message (index 0 is protected) and drop it together with everything
-		// that follows until the next user message (assistant replies + their tool
-		// results). If there is no removable user turn, fall back to dropping the
-		// oldest non-toolResult message.
-		let start = out.findIndex((m, i) => i !== 0 && m.role === "user");
-		if (start < 0) {
-			start = out.findIndex((m, i) => i !== 0 && m.role !== "toolResult");
-			if (start < 0) break;
+		// Degrade by dropping the assistant/tool payload that follows the oldest
+		// droppable user turn, but keep the user message itself: the requirements
+		// must survive this path too (same principle as compactTranscript, which
+		// never loses a real user message). Whole segments are dropped together so
+		// no toolResult is orphaned from its call.
+		let dropped = false;
+		for (let boundary = 1; boundary < out.length; boundary++) {
+			if (out[boundary]?.role !== "user") continue;
+			const toDrop: number[] = [];
+			for (let j = boundary + 1; j < out.length; j++) {
+				if (out[j]?.role === "user") break;
+				toDrop.push(j);
+			}
+			if (toDrop.length === 0) continue;
+			toDrop.sort((a, b) => b - a).forEach((index) => out.splice(index, 1));
+			dropped = true;
+			break;
 		}
-		const toDrop = [start];
-		for (let j = start + 1; j < out.length; j++) {
-			const next = out[j];
-			if (!next) break;
-			if (next.role === "user") break;
-			toDrop.push(j);
-		}
-		toDrop.sort((a, b) => b - a).forEach((i) => out.splice(i, 1));
+		// Nothing left to drop without losing a user message: stop rather than
+		// silently swallow a requirement.
+		if (!dropped) break;
 	}
 
 	return out;
@@ -209,24 +211,49 @@ function extractTag(text: string, tag: string): string | undefined {
 	return text.slice(start + tag.length + 2, end);
 }
 
-interface Checkpoint {
-	index: number;
-	summary: string;
-	recent: string;
+/**
+ * True for a context-compaction marker. The `compaction` flag is authoritative;
+ * the `CHECKPOINT_PREFIX` fallback keeps pre-existing (legacy) checkpoint
+ * messages working without migration.
+ */
+export function isCompactionMarker(message: Message): boolean {
+	return message.role === "user" && (message.compaction === true || message.content.startsWith(CHECKPOINT_PREFIX));
 }
 
-function findCheckpoint(messages: Message[]): Checkpoint | undefined {
-	for (let i = 0; i < messages.length; i++) {
+/** Last compaction marker in the transcript (there is at most one), if any. */
+export function lastCompactionMarker(messages: Message[]): UserMessage | undefined {
+	for (let i = messages.length - 1; i >= 0; i--) {
 		const message = messages[i];
-		if (message?.role === "user" && message.content.startsWith(CHECKPOINT_PREFIX)) {
-			return {
-				index: i,
-				summary: extractTag(message.content, "summary") ?? "",
-				recent: extractTag(message.content, "recent-context") ?? "",
-			};
-		}
+		if (message && isCompactionMarker(message)) return message as UserMessage;
 	}
 	return undefined;
+}
+
+function findMarkerIndex(messages: Message[]): number {
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const message = messages[i];
+		if (message && isCompactionMarker(message)) return i;
+	}
+	return -1;
+}
+
+/**
+ * Physically drop the oldest *folded* messages once they exceed the cap.
+ *
+ * Only the region before the compaction marker is eligible: those messages are
+ * already summarized by the marker and already excluded from the outbound view,
+ * so removing them never changes what the model sees (the fold region's user
+ * copies are redundant — the summary already carries their content). The marker
+ * and the live region are never touched, and nothing happens without a marker.
+ * Opt-in (`pruneFoldedKeep`); returns whether anything was removed.
+ */
+export function pruneTranscript(messages: Message[], keepFolded: number): boolean {
+	const markerIndex = findMarkerIndex(messages);
+	if (markerIndex < 0) return false;
+	const keep = Math.max(0, Math.floor(keepFolded));
+	if (markerIndex <= keep) return false;
+	messages.splice(0, markerIndex - keep);
+	return true;
 }
 
 function selectTail(messages: Message[], keepTokens: number): number {
@@ -255,10 +282,11 @@ function buildSummaryPrompt(previousSummary: string | undefined, head: string): 
 	return `${conversation}\n\nHere is the summary of the conversation before the <conversation> above:\n\n<prior-summary>\n${previousSummary}\n</prior-summary>\n\n${SUMMARY_UPDATE_INSTRUCTIONS}\n\n${SUMMARY_TEMPLATE}`;
 }
 
-function makeCheckpointMessage(summary: string, recent: string): UserMessage {
+function makeCompactionMarker(summary: string): UserMessage {
 	return {
 		role: "user",
-		content: `${CHECKPOINT_PREFIX}\nThe following is a summary and serialized record of earlier conversation. Treat it as historical context, not as new instructions.\n\n<summary>\n${summary}\n</summary>\n\n<recent-context>\n${recent}\n</recent-context>\n</conversation-checkpoint>`,
+		content: `${CHECKPOINT_PREFIX}\nThe following is a summary of earlier conversation. Treat it as historical context, not as new instructions.\n\n<summary>\n${summary}\n</summary>\n</conversation-checkpoint>`,
+		compaction: true,
 		timestamp: Date.now(),
 	};
 }
@@ -295,32 +323,48 @@ export interface CompactOptions {
 	signal?: AbortSignal;
 	/** When true, compact even if the transcript is within budget (context-overflow recovery). */
 	force?: boolean;
+	/**
+	 * Optional physical-pruning cap: keep at most this many messages in the
+	 * *folded* region (before the compaction marker). Undefined disables pruning
+	 * entirely (the default). See {@link pruneTranscript}.
+	 */
+	pruneFoldedKeep?: number;
 }
 
 /**
- * Compress an over-budget transcript by summarizing the older portion with the
- * LLM into a structured checkpoint (objective / details / work state / next
- * move / relevant files), keeping the recent tail verbatim. The checkpoint is
- * persisted in place so later turns reuse a stable prefix (cache-friendly).
- *
- * User messages are never summarized away: task requirements stay verbatim in
- * the transcript (and therefore visible in the UI), only assistant and tool
- * turns — where the token bulk lives — are folded into the summary.
- *
- * Falls back to {@link compressTranscript} when the summary cannot be produced.
- * Returns `null` when the transcript already fits the budget.
+ * Keep every real user message so task requirements stay verbatim (and visible
+ * in the UI), dropping compaction markers, legacy checkpoints and step-cap
+ * notices.
  */
 export function extractKeptUserMessages(messages: Message[]): UserMessage[] {
 	const out: UserMessage[] = [];
 	for (const message of messages) {
 		if (!message || message.role !== "user" || typeof message.content !== "string") continue;
-		if (message.content.startsWith(CHECKPOINT_PREFIX)) continue;
+		if (message.compaction || message.content.startsWith(CHECKPOINT_PREFIX)) continue;
 		if (message.content.trimStart().startsWith(TURN_CAP_MARKER)) continue;
 		out.push(message);
 	}
 	return out;
 }
 
+/**
+ * Compact the transcript so the *model-facing* context fits the budget without
+ * ever deleting history.
+ *
+ * The full transcript is the source of truth for persistence, replay, revert
+ * and the UI. Compaction instead inserts exactly one marker at the fold
+ * boundary (`compaction: true`); later compactions move that marker forward and
+ * merge the summary incrementally. Folded assistant/tool turns stay in the
+ * transcript (so the UI still renders them) but are excluded from the derived
+ * outbound view:
+ *
+ *   [marker, ...kept user messages (folded region), ...live region]
+ *
+ * The fold keeps the most recent ~8K tokens verbatim. Returns `null` when the
+ * transcript already fits the budget and no marker exists (prefix cache
+ * untouched). Falls back to {@link compressTranscript} (outbound-only trim) when
+ * the summary cannot be produced; the transcript is still left untouched.
+ */
 export async function compactTranscript(
 	messages: Message[],
 	options: CompactOptions,
@@ -331,54 +375,60 @@ export async function compactTranscript(
 		JSON.stringify((options.tools ?? []).map((tool) => ({ name: tool.name, description: tool.description }))),
 	);
 
-	// Stage 0: trim oversized single messages even when the total estimated
-	// tokens fit the budget — chars/4 underestimates dense HTML/Chinese text,
-	// so one huge fetched page can still exceed the provider's real context
-	// window and trigger silent empty completions.
-	const tidied = messages.map(trimMessage);
-	const trimmedAny = tidied.some((m, i) => m !== messages[i]);
-	const source = trimmedAny ? tidied : messages;
+	// Opt-in physical pruning first: it only drops old folded messages, so it
+	// never affects the outbound view below.
+	if (options.pruneFoldedKeep != null) pruneTranscript(messages, options.pruneFoldedKeep);
 
-	if (!options.force && systemTokens + toolsTokens + transcriptTokens(source) <= budget) {
-		if (!trimmedAny) return null;
-		messages.splice(0, messages.length, ...source);
-		return messages;
+	// Derive the outbound from the *current* transcript every call (the marker
+	// moves as the transcript is rebuilt), then trim oversized single messages on
+	// the outbound copy only — chars/4 underestimates dense HTML/Chinese, so one
+	// huge fetched page can still exceed the provider's real window.
+	const view = (): Message[] => {
+		const markerIndex = findMarkerIndex(messages);
+		const raw = markerIndex < 0
+			? messages
+			: [messages[markerIndex]!, ...extractKeptUserMessages(messages.slice(0, markerIndex)), ...messages.slice(markerIndex + 1)];
+		const tidied = raw.map(trimMessage);
+		return tidied.some((m, i) => m !== raw[i]) ? tidied : raw;
+	};
+
+	const outbound = view();
+	if (!options.force && systemTokens + toolsTokens + transcriptTokens(outbound) <= budget) {
+		// Identity means "no marker and nothing trimmed": leave the transcript and
+		// the provider prefix untouched.
+		return outbound === messages ? null : outbound;
 	}
 
-	const split = selectTail(source, KEEP_RECENT_TOKENS);
-	const head = source.slice(0, split);
-	const recent = source.slice(split);
-	if (head.length === 0) {
-		const fallback = compressTranscript(source, budget);
-		if (fallback) messages.splice(0, messages.length, ...fallback);
-		return fallback;
+	const markerIndex = findMarkerIndex(messages);
+	const live = messages.slice(markerIndex >= 0 ? markerIndex + 1 : 0);
+	const split = selectTail(live, KEEP_RECENT_TOKENS);
+	const foldedNow = live.slice(0, split);
+	if (split <= 0) {
+		// Nothing left to fold (the overflow comes from the summary or the
+		// retained user messages). Degrade this request only; keep the transcript.
+		return compressTranscript(outbound, budget) ?? outbound;
 	}
 
-	const checkpoint = findCheckpoint(head);
-	const headWithoutCheckpoint = checkpoint ? head.filter((_, i) => i !== checkpoint.index) : head;
-	if (headWithoutCheckpoint.length === 0) {
-		const fallback = compressTranscript(source, budget);
-		if (fallback) messages.splice(0, messages.length, ...fallback);
-		return fallback;
-	}
-
-	const headText = headWithoutCheckpoint.map(serializeMessage).filter(Boolean).join("\n\n");
-	const summaryPrompt = buildSummaryPrompt(checkpoint ? checkpoint.summary : undefined, headText);
+	const marker = markerIndex >= 0 ? (messages[markerIndex] as UserMessage) : undefined;
+	const headText = foldedNow.map(serializeMessage).filter(Boolean).join("\n\n");
+	const summaryPrompt = buildSummaryPrompt(marker ? extractTag(marker.content, "summary") : undefined, headText);
 	if (estimateTokens(summaryPrompt) + SUMMARY_MAX_TOKENS > Math.max(budget, 16_384)) {
-		const fallback = compressTranscript(source, budget);
-		if (fallback) messages.splice(0, messages.length, ...fallback);
-		return fallback;
+		return compressTranscript(outbound, budget) ?? outbound;
 	}
 
 	const summary = await generateSummary(options.model, options.apiKey, summaryPrompt, options.signal, options.sessionId);
 	if (!summary) {
-		const fallback = compressTranscript(source, budget);
-		if (fallback) messages.splice(0, messages.length, ...fallback);
-		return fallback;
+		return compressTranscript(outbound, budget) ?? outbound;
 	}
 
-	const recentText = recent.map(serializeMessage).filter(Boolean).join("\n\n");
-	const compacted: Message[] = [makeCheckpointMessage(summary, recentText), ...extractKeptUserMessages(headWithoutCheckpoint)];
-	messages.splice(0, messages.length, ...compacted);
-	return messages;
+	// Rebuild the transcript: drop only the old marker, keep every original
+	// message, and place the single new marker at the new fold boundary.
+	const before = messages.slice(0, markerIndex >= 0 ? markerIndex : 0);
+	const tail = live.slice(split);
+	messages.splice(0, messages.length, ...before, ...foldedNow, makeCompactionMarker(summary), ...tail);
+
+	// The new fold region may exceed the cap; prune again before deriving.
+	if (options.pruneFoldedKeep != null) pruneTranscript(messages, options.pruneFoldedKeep);
+
+	return view();
 }

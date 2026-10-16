@@ -177,6 +177,7 @@ Flags:
   --max-context-tokens <n>  Trim/drop transcript when input exceeds this (default 128000)
   --max-image-bytes <n>     Cap outbound image bytes per request (default 8388608); oldest images are omitted past it
   --max-turns <n>           Max assistant turns per run before a forced summary (default 50)
+  --allow-private-fetch     Let fetch reach private/link-local addresses (loopback stays blocked)
   --no-thinking         Disable extended thinking (enabled by default)
   --port <n>            GUI port (default 9399)
   --no-open             Do not auto-open the browser (gui mode)

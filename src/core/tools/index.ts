@@ -14,7 +14,7 @@ export { askUserSchema, createAskUserTool, type AskUserInput, type AskUserOption
 export { bashSchema, createBashTool, doubleLoopVariables, type BashInput, type BashToolOptions } from "./bash.ts";
 export { subAgentSchema, createSubAgentTool, type SubAgentInput, type SubAgentToolOptions } from "./subagent.ts";
 export { editSchema, createEditTool, type EditInput } from "./edit.ts";
-export { createFetchTool, fetchSchema, type FetchInput } from "./fetch.ts";
+export { createFetchTool, fetchSchema, type FetchInput, type FetchToolOptions } from "./fetch.ts";
 export { globSchema, createGlobTool, type GlobInput } from "./glob.ts";
 export { grepSchema, createGrepTool, type GrepInput } from "./grep.ts";
 export { readSchema, createReadTool, type ReadInput } from "./read.ts";
@@ -24,7 +24,7 @@ export { writeSchema, createWriteTool, type WriteInput } from "./write.ts";
 /**
  * Create the full set of bundled coding tools bound to a working directory.
  */
-export function createAllTools(cwd: string, options?: BashToolOptions): AgentTool[] {
+export function createAllTools(cwd: string, options?: BashToolOptions & { allowPrivateFetch?: boolean }): AgentTool[] {
 	return [
 		createReadTool(cwd) as unknown as AgentTool,
 		createBashTool(cwd, options) as unknown as AgentTool,
@@ -33,7 +33,7 @@ export function createAllTools(cwd: string, options?: BashToolOptions): AgentToo
 		createEditTool(cwd) as unknown as AgentTool,
 		createWriteTool(cwd) as unknown as AgentTool,
 		createApplyPatchTool(cwd) as unknown as AgentTool,
-		createFetchTool() as unknown as AgentTool,
+	createFetchTool({ allowPrivate: options?.allowPrivateFetch }) as unknown as AgentTool,
 		createScanTool(cwd) as unknown as AgentTool,
 	];
 }

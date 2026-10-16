@@ -142,12 +142,296 @@ describe("applyToolBudget", () => {
 		expect(firstCall && firstCall.type === "toolCall" ? JSON.stringify(firstCall.arguments).length : 0).toBeLessThan(2_000);
 	});
 
+	it("pins fresh read results while aging out model-authored payload", () => {
+		const readCall: Message = {
+			role: "assistant",
+			content: [{ type: "toolCall", id: "rd", name: "read", arguments: { path: "a.ts" } }],
+			api: "openai-completions",
+			provider: "openai",
+			model: "m",
+			usage: { input: 0, output: 0, totalTokens: 0 },
+			stopReason: "tool",
+			timestamp: 1,
+		};
+		const readRes: Message = {
+			role: "toolResult",
+			toolCallId: "rd",
+			toolName: "read",
+			content: "FILE-A-BODY",
+			isError: false,
+			timestamp: 2,
+			details: { path: "a.ts" },
+		};
+		const messages: Message[] = [readCall, readRes];
+		for (let i = 0; i < 20; i++) {
+			messages.push(call(`w${i}`, "Z".repeat(20_000), 10 + i * 2));
+			messages.push(result(`w${i}`, "R".repeat(5_000), 11 + i * 2));
+		}
+		const out = applyToolBudget(messages);
+		const kept = out.messages.find((m) => m.role === "toolResult" && m.toolCallId === "rd");
+		// The read is the only copy of that file's content the model has, so it
+		// must survive; the model-authored write bodies may still be trimmed.
+		expect(kept?.role === "toolResult" ? kept.content : "").toBe("FILE-A-BODY");
+		expect(out.trimmedCalls).toBeGreaterThan(0);
+	});
+
+	it("does not pin a read result whose file was written since", () => {
+		const readCall: Message = {
+			role: "assistant",
+			content: [{ type: "toolCall", id: "rd", name: "read", arguments: { path: "a.ts" } }],
+			api: "openai-completions",
+			provider: "openai",
+			model: "m",
+			usage: { input: 0, output: 0, totalTokens: 0 },
+			stopReason: "tool",
+			timestamp: 1,
+		};
+		const readRes: Message = {
+			role: "toolResult",
+			toolCallId: "rd",
+			toolName: "read",
+			content: "STALE-BODY",
+			isError: false,
+			timestamp: 2,
+			details: { path: "a.ts" },
+		};
+		const messages: Message[] = [readCall, readRes, call("a", "Z".repeat(20_000), 3), result("a", "wrote", 4)];
+		for (let i = 0; i < 20; i++) {
+			messages.push(call(`w${i}`, "Z".repeat(20_000), 10 + i * 2));
+			messages.push(result(`w${i}`, "R".repeat(5_000), 11 + i * 2));
+		}
+		const out = applyToolBudget(messages);
+		const got = out.messages.find((m) => m.role === "toolResult" && m.toolCallId === "rd");
+		// Showing the pre-edit body would be worse than a tombstone.
+		expect(got?.role === "toolResult" ? got.content : "").toContain("[Old tool result cleared:");
+	});
+
+	it("pins at most one body per path so re-reading one file cannot evict another", () => {
+		// A model that re-reads a.ts must not push b.ts out of the pinned set.
+		const readCall = (id: string, path: string, ts: number): Message => ({
+			role: "assistant",
+			content: [{ type: "toolCall", id, name: "read", arguments: { path } }],
+			api: "openai-completions",
+			provider: "openai",
+			model: "m",
+			usage: { input: 0, output: 0, totalTokens: 0 },
+			stopReason: "tool",
+			timestamp: ts,
+		});
+		const readRes = (id: string, path: string, body: string, ts: number): Message => ({
+			role: "toolResult",
+			toolCallId: id,
+			toolName: "read",
+			content: body,
+			isError: false,
+			timestamp: ts,
+			details: { path },
+		});
+		const messages: Message[] = [
+			readCall("a1", "a.ts", 1),
+			readRes("a1", "a.ts", "BODY-A-1", 2),
+			readCall("b1", "b.ts", 3),
+			readRes("b1", "b.ts", "BODY-B-1", 4),
+		];
+		// Six more whole reads of a.ts, each large enough to fill the window alone.
+		for (let i = 0; i < 6; i++) {
+			messages.push(readCall(`a${i + 2}`, "a.ts", 10 + i * 2));
+			messages.push(readRes(`a${i + 2}`, "a.ts", `BODY-A-${i + 2}-${"Z".repeat(30_000)}`, 11 + i * 2));
+		}
+		const out = applyToolBudget(messages);
+		const kept = out.messages.find((m) => m.role === "toolResult" && m.toolCallId === "b1");
+		expect(kept?.role === "toolResult" ? kept.content : "").toBe("BODY-B-1");
+	});
+
+	it("keeps two files that share a basename in different directories", () => {
+		// Comparing an upstream copy with a local copy is the case that breaks
+		// basename identity: each read would evict the other's pinned body.
+		const readCall = (id: string, path: string, ts: number): Message => ({
+			role: "assistant",
+			content: [{ type: "toolCall", id, name: "read", arguments: { path } }],
+			api: "openai-completions",
+			provider: "openai",
+			model: "m",
+			usage: { input: 0, output: 0, totalTokens: 0 },
+			stopReason: "tool",
+			timestamp: ts,
+		});
+		const readRes = (id: string, path: string, body: string, ts: number, range?: [number, number]): Message => ({
+			role: "toolResult",
+			toolCallId: id,
+			toolName: "read",
+			content: body,
+			isError: false,
+			timestamp: ts,
+			details: range ? { path, startLine: range[0], endLine: range[1] } : { path },
+		});
+		const upstream = "D:\\github\\dsh-our-free-model\\src\\upstream.js";
+		const local = "D:\\AI_projects\\our-free-model\\src\\upstream.js";
+		const messages: Message[] = [
+			readCall("u1", upstream, 1),
+			readRes("u1", upstream, "UPSTREAM-BODY", 2),
+			call("filler", "Z".repeat(20_000), 3),
+			result("filler", "wrote", 4),
+			readCall("l1", local, 5),
+			readRes("l1", local, "LOCAL-BODY", 6),
+		];
+		for (let i = 0; i < 12; i++) {
+			messages.push(call(`w${i}`, "Z".repeat(20_000), 10 + i * 2));
+			messages.push(result(`w${i}`, "R".repeat(5_000), 11 + i * 2));
+		}
+		const out = applyToolBudget(messages);
+		const body = (id: string) => {
+			const m = out.messages.find((x) => x.role === "toolResult" && x.toolCallId === id);
+			return m?.role === "toolResult" ? m.content : "";
+		};
+		expect(body("u1")).toBe("UPSTREAM-BODY");
+		expect(body("l1")).toBe("LOCAL-BODY");
+
+		// Two disjoint slices of one file are two facts, not one.
+		const sliced: Message[] = [
+			readCall("s1", local, 1),
+			readRes("s1", local, "LOCAL-HEAD", 2, [1, 140]),
+			readCall("s2", local, 3),
+			readRes("s2", local, "LOCAL-TAIL", 4, [140, 322]),
+		];
+		for (let i = 0; i < 12; i++) {
+			sliced.push(call(`t${i}`, "Z".repeat(20_000), 10 + i * 2));
+			sliced.push(result(`t${i}`, "R".repeat(5_000), 11 + i * 2));
+		}
+		const slicedOut = applyToolBudget(sliced);
+		const slice = (id: string) => {
+			const m = slicedOut.messages.find((x) => x.role === "toolResult" && x.toolCallId === id);
+			return m?.role === "toolResult" ? m.content : "";
+		};
+		expect(slice("s1")).toBe("LOCAL-HEAD");
+		expect(slice("s2")).toBe("LOCAL-TAIL");
+	});
+
+	it("does not call a read stale when a different same-named file was written", () => {
+		const readCall = (id: string, path: string, ts: number): Message => ({
+			role: "assistant",
+			content: [{ type: "toolCall", id, name: "read", arguments: { path } }],
+			api: "openai-completions",
+			provider: "openai",
+			model: "m",
+			usage: { input: 0, output: 0, totalTokens: 0 },
+			stopReason: "tool",
+			timestamp: ts,
+		});
+		const upstream = "D:\\github\\dsh-our-free-model\\src\\upstream.js";
+		const local = "D:\\AI_projects\\our-free-model\\src\\upstream.js";
+		const messages: Message[] = [
+			readCall("u1", upstream, 1),
+			{ role: "toolResult", toolCallId: "u1", toolName: "read", content: "UPSTREAM-BODY", isError: false, timestamp: 2, details: { path: upstream } },
+			{
+				role: "assistant",
+				content: [{ type: "toolCall", id: "e1", name: "edit", arguments: { path: local, oldString: "a", newString: "b" } }],
+				api: "openai-completions",
+				provider: "openai",
+				model: "m",
+				usage: { input: 0, output: 0, totalTokens: 0 },
+				stopReason: "tool",
+				timestamp: 3,
+			},
+			{ role: "toolResult", toolCallId: "e1", toolName: "edit", content: "edited", isError: false, timestamp: 4 },
+		];
+		for (let i = 0; i < 12; i++) {
+			messages.push(call(`w${i}`, "Z".repeat(20_000), 10 + i * 2));
+			messages.push(result(`w${i}`, "R".repeat(5_000), 11 + i * 2));
+		}
+		const out = applyToolBudget(messages);
+		const got = out.messages.find((m) => m.role === "toolResult" && m.toolCallId === "u1");
+		expect(got?.role === "toolResult" ? got.content : "").toBe("UPSTREAM-BODY");
+	});
+
+	it("still calls a read stale when a relative write names the same file", () => {
+		const path = "D:\\AI_projects\\our-free-model\\src\\upstream.js";
+		const messages: Message[] = [
+			{
+				role: "assistant",
+				content: [{ type: "toolCall", id: "r1", name: "read", arguments: { path } }],
+				api: "openai-completions",
+				provider: "openai",
+				model: "m",
+				usage: { input: 0, output: 0, totalTokens: 0 },
+				stopReason: "tool",
+				timestamp: 1,
+			},
+			{ role: "toolResult", toolCallId: "r1", toolName: "read", content: "STALE-BODY", isError: false, timestamp: 2, details: { path } },
+			{
+				role: "assistant",
+				content: [{ type: "toolCall", id: "w1", name: "write", arguments: { path: "src/upstream.js", content: "new" } }],
+				api: "openai-completions",
+				provider: "openai",
+				model: "m",
+				usage: { input: 0, output: 0, totalTokens: 0 },
+				stopReason: "tool",
+				timestamp: 3,
+			},
+			{ role: "toolResult", toolCallId: "w1", toolName: "write", content: "wrote", isError: false, timestamp: 4 },
+		];
+		for (let i = 0; i < 12; i++) {
+			messages.push(call(`w${i}`, "Z".repeat(20_000), 10 + i * 2));
+			messages.push(result(`w${i}`, "R".repeat(5_000), 11 + i * 2));
+		}
+		const out = applyToolBudget(messages);
+		const got = out.messages.find((m) => m.role === "toolResult" && m.toolCallId === "r1");
+		expect(got?.role === "toolResult" ? got.content : "").toContain("[Old tool result cleared:");
+	});
+
 	it("never mutates the input messages", () => {
 		const messages: Message[] = [{ role: "user", content: "go", timestamp: 0 }];
 		for (let i = 0; i < 20; i++) messages.push(call(`t${i}`, "Z".repeat(20_000), i * 2 + 1));
 		const snapshot = JSON.stringify(messages);
 		applyToolBudget(messages);
 		expect(JSON.stringify(messages)).toBe(snapshot);
+	});
+
+	it("replaces cleared results with a tombstone naming tool, path and size", () => {
+		const messages: Message[] = [{ role: "user", content: "go", timestamp: 0 }];
+		for (let i = 0; i < 20; i++) {
+			messages.push(call(`t${i}`, "Z".repeat(20_000), i * 2 + 1));
+			messages.push(result(`t${i}`, "R".repeat(5_000), i * 2 + 2));
+		}
+		const out = applyToolBudget(messages);
+		const cleared = out.messages.filter(
+			(m): m is Extract<Message, { role: "toolResult" }> => m.role === "toolResult" && m.content.startsWith("[Old tool result cleared:"),
+		);
+		expect(cleared.length).toBeGreaterThan(0);
+		expect(cleared[0]?.content).toContain("write t0.ts");
+		expect(cleared[0]?.content).toMatch(/\(\d+\.\dKB\)/);
+	});
+
+	it("keeps only the newest todowrite result verbatim", () => {
+		function todoCall(id: string, timestamp: number): Message {
+			return {
+				role: "assistant",
+				content: [{ type: "toolCall", id, name: "todowrite", arguments: { todos: [{ content: "a", status: "active" }] } }],
+				api: "openai-completions",
+				provider: "openai",
+				model: "m",
+				usage: { input: 0, output: 0, totalTokens: 0 },
+				stopReason: "tool",
+				timestamp,
+			};
+		}
+		function todoResult(id: string, content: string, timestamp: number): Message {
+			return { role: "toolResult", toolCallId: id, toolName: "todowrite", content, isError: false, timestamp };
+		}
+		const messages: Message[] = [{ role: "user", content: "go", timestamp: 0 }];
+		messages.push(todoCall("old-todo", 1), todoResult("old-todo", "Todo list updated:\n- [ ] a", 2));
+		messages.push(todoCall("new-todo", 3), todoResult("new-todo", "Todo list updated:\n- [x] a", 4));
+		for (let i = 0; i < 20; i++) {
+			messages.push(call(`t${i}`, "Z".repeat(20_000), 10 + i * 2));
+			messages.push(result(`t${i}`, "R".repeat(5_000), 11 + i * 2));
+		}
+		const out = applyToolBudget(messages);
+		const todos = out.messages.filter(
+			(m): m is Extract<Message, { role: "toolResult" }> => m.role === "toolResult" && m.toolName === "todowrite",
+		);
+		expect(todos).toHaveLength(2);
+		expect(todos[0]?.content).toContain("[Old tool result cleared: todowrite");
+		expect(todos[1]?.content).toContain("- [x] a");
 	});
 });
 

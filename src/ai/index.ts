@@ -52,10 +52,12 @@ export async function complete(
 		stopReason: "error",
 		errorMessage: "Stream ended without a message",
 		timestamp: Date.now(),
+		reasoningEffort: model.reasoningEffort,
 	};
 	for await (const event of events) {
 		if (event.type === "done" || event.type === "error") {
 			last = event.message;
+			if (last.reasoningEffort === undefined) last.reasoningEffort = model.reasoningEffort;
 		}
 	}
 	return last;

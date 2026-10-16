@@ -88,4 +88,16 @@ describe("createAgent system prompt", () => {
 		const prompt = createAgent({ config: BASE_CONFIG, cwd: freshDir() }).state.systemPrompt;
 		expect(prompt).not.toContain("Project conventions:");
 	});
+
+	it("gates the delegation guidance on the experiment arm", () => {
+		const dir = freshDir();
+		const off = createAgent({
+			config: BASE_CONFIG,
+			cwd: dir,
+			experiment: { mode: "anchor", anchor: true, delegate: false },
+		}).state.systemPrompt;
+		expect(off).not.toContain("explore sub-agent");
+		const on = createAgent({ config: BASE_CONFIG, cwd: dir }).state.systemPrompt;
+		expect(on).toContain("explore sub-agent");
+	});
 });

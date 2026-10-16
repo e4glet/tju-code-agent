@@ -9,7 +9,7 @@ describe("buildWindowsRelaunchArgs", () => {
 			"/s",
 			"/c",
 			"start",
-			"Tju code",
+			"TJU Code",
 			"C:\\Program Files\\nodejs\\node.exe",
 			"D:\\app\\dist\\cli.js",
 		]);

@@ -34,7 +34,11 @@ async function toOpenAiMessages(context: Context, imageBudget: number): Promise<
 	const { resolveAttachment } = context;
 	const budgeted = applyImageBudget(applyToolBudget(sanitizeMessages(context.messages)).messages, imageBudget);
 	const messages = budgeted.messages;
-	const out: unknown[] = [];
+	// OpenAI-compatible endpoints carry the system prompt as the first message of
+	// the same array (there is no dedicated `system` field like Anthropic's).
+	// Omitting it silently dropped the entire system prompt — tool discipline,
+	// project docs, the working directory — for every OpenAI-style provider.
+	const out: unknown[] = context.systemPrompt ? [{ role: "system", content: context.systemPrompt }] : [];
 	for (const m of messages) {
 		switch (m.role) {
 			case "user": {

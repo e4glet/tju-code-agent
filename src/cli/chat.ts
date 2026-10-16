@@ -26,16 +26,33 @@ function subscribeRenderer(agent: Agent): () => void {
 				thinkingPrinted = false;
 				break;
 			case "message_update": {
-				if (event.message.role !== "assistant") break;
-				if (!thinkingPrinted && textLength === 0 && hasThinking(event.message)) {
-					write("\u001b[90m[思考中...]\u001b[0m\n");
-					thinkingPrinted = true;
+				// Full snapshot (the end-of-stream replace, or a legacy log replay):
+				// print the tail beyond what has already been written.
+				if (event.message) {
+					if (event.message.role !== "assistant") break;
+					if (!thinkingPrinted && textLength === 0 && hasThinking(event.message)) {
+						write("\u001b[90m[思考中...]\u001b[0m\n");
+						thinkingPrinted = true;
+					}
+					if (event.message.stopReason === "tool") break;
+					const full = extractText(event.message);
+					if (full.length > textLength) {
+						write(full.slice(textLength));
+						textLength = full.length;
+					}
+					break;
 				}
-				if (event.message.stopReason === "tool") break;
-				const full = extractText(event.message);
-				if (full.length > textLength) {
-					write(full.slice(textLength));
-					textLength = full.length;
+				// Delta frames carry only the new text.
+				if (event.part === "thinking") {
+					if (!thinkingPrinted) {
+						write("\u001b[90m[思考中...]\u001b[0m\n");
+						thinkingPrinted = true;
+					}
+					break;
+				}
+				if (event.part === "text" && event.delta) {
+					write(event.delta);
+					textLength += event.delta.length;
 				}
 				break;
 			}
@@ -166,7 +183,10 @@ export async function runChat(config: RunConfig, cwd: string): Promise<void> {
 				if (signal?.aborted) return false;
 				const answer = (
 					await rl.question(
-						`\n\u001b[33m[权限]\u001b[0m 工具 ${request.toolName} 将访问工作目录外的目录：\n  ${request.scopeDir}\n允许? (y/n) > `,
+						`\n\u001b[33m[权限]\u001b[0m 工具 ${request.toolName} 将访问工作目录外的目录：\n  ${request.scopeDir}` +
+							(request.via ? `\n  触发位置：${request.via}` : "") +
+							(request.workdir ? `\n  当前工作目录：${request.workdir}` : "") +
+							"\\n允许? (y/n) > ",
 						{ signal },
 					)
 				)

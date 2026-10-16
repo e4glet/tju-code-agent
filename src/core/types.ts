@@ -101,6 +101,13 @@ export interface UserMessage {
 	 * as a single round, so the answer footer stays at the run's true end.
 	 */
 	steering?: boolean;
+	/**
+	 * True when this message is a context-compaction marker rather than a real
+	 * user turn. Compaction never deletes history: it inserts (and later moves)
+	 * one marker at the fold boundary, and the model-facing context is derived
+	 * from it. Only the local compactor sets this; model output cannot.
+	 */
+	compaction?: boolean;
 	timestamp: number;
 }
 
@@ -114,6 +121,7 @@ export interface AssistantMessage {
 	stopReason: StopReason;
 	errorMessage?: string;
 	timestamp: number;
+	reasoningEffort?: ReasoningEffort;
 }
 
 export interface ToolResultMessage {
@@ -255,12 +263,23 @@ export interface AgentLoopConfig {
 	afterToolCall?: (context: AfterToolCallContext, signal?: AbortSignal) => Promise<AgentToolResult | undefined>;
 	/**
 	 * Optional self-correction hook run after each turn (and its tool results).
-	 * Return a corrective user message to inject into the transcript (e.g. when
-	 * the agent repeats the same action or produces an empty turn), or `null` to
-	 * continue normally. Runs once per turn and only injects when non-null, so
-	 * a focused agent is never disturbed.
+	 * Return a one-turn corrective instruction (e.g. when the agent repeats the
+	 * same action or produces an empty turn), or `null` to continue normally. The
+	 * instruction is delivered to the next request as an ephemeral trailing user
+	 * message: it is NOT added to the transcript, the work item, the run log or
+	 * replay, so it cannot be mistaken for a persisted user turn or survive
+	 * compaction. Runs once per turn and only when non-null, so a focused agent is
+	 * never disturbed.
 	 */
 	afterTurn?: (context: AfterTurnContext) => Promise<string | null>;
+	/**
+	 * Optional per-turn goal anchor. When it returns a string, that text is sent
+	 * with every request as an ephemeral trailing instruction — never added to the
+	 * transcript, never persisted — so the standing objective and the open plan
+	 * items stay in view during long runs without polluting history. Return
+	 * `undefined` to send nothing.
+	 */
+	getPlanAnchor?: () => string | undefined;
 	/** Maximum assistant turns per run. When exceeded, the loop injects a final summary turn and stops. Defaults to 50. */
 	maxTurns?: number;
 	/**
@@ -286,8 +305,34 @@ export type AgentEvent =
 	| { type: "turn_start" }
 	| { type: "turn_end"; message: AssistantMessage; toolResults: ToolResultMessage[] }
 	| { type: "message_start"; message: Message }
-	| { type: "message_update"; message: AssistantMessage; delta: string }
+	/**
+	 * Incremental progress of the streaming assistant message.
+	 *
+	 * Only the new text is sent per frame — resending the whole accumulated
+	 * message every token made long answers quadratic on the wire, in the run
+	 * log and in replay (a 45 KB answer once produced 92 MB of frames). Consumers
+	 * accumulate `delta` themselves and key the buffer by `messageId`.
+	 * `message` carries a full snapshot only for the end-of-stream replace, or
+	 * when replaying a run logged before this shape existed; when it is present
+	 * it supersedes the accumulated buffer.
+	 */
+	| {
+			type: "message_update";
+			delta: string;
+			/** Which accumulation buffer `delta` extends; absent on full snapshots. */
+			part?: "thinking" | "text";
+			/** Stable id of the streamed message (its timestamp); absent on snapshots. */
+			messageId?: number;
+			/** Full snapshot, if any (end-of-stream replace / legacy log replay). */
+			message?: AssistantMessage;
+	  }
 	| { type: "message_end"; message: Message }
+	/**
+	 * A context compaction inserted/moved its marker. Purely informational for
+	 * the UI (renders the summary inline); the marker is already in the
+	 * transcript — do not push it again.
+	 */
+	| { type: "compaction"; message: UserMessage }
 	| { type: "tool_start"; toolCallId: string; toolName: string; args: unknown }
 	| { type: "tool_update"; toolCallId: string; toolName: string; partialContent: string }
 	| { type: "tool_end"; toolCallId: string; toolName: string; result: AgentToolResult; isError: boolean }

@@ -153,6 +153,31 @@ describe("openai image budget", () => {
 	});
 });
 
+describe("openai system prompt", () => {
+	it("sends the system prompt as the first message of the array", async () => {
+		const context: Context = {
+			systemPrompt: "SYSTEM-RULES-HERE",
+			messages: [{ role: "user", content: "hi", timestamp: 1 }],
+			resolveAttachment,
+		};
+		const { recorded } = await run(context, undefined, false);
+		const sent = recorded[0]!.body.messages as Array<Record<string, unknown>>;
+		expect(sent[0]).toEqual({ role: "system", content: "SYSTEM-RULES-HERE" });
+		expect(sent[1]?.role).toBe("user");
+	});
+
+	it("omits the system message when the prompt is empty", async () => {
+		const context: Context = {
+			systemPrompt: "",
+			messages: [{ role: "user", content: "hi", timestamp: 1 }],
+			resolveAttachment,
+		};
+		const { recorded } = await run(context, undefined, false);
+		const sent = recorded[0]!.body.messages as Array<Record<string, unknown>>;
+		expect(sent[0]?.role).toBe("user");
+	});
+});
+
 describe("openai tool budget (real request body)", () => {
 	it("shrinks an old write-heavy transcript and keeps every call paired", async () => {
 		const context: Context = { systemPrompt: "", messages: longTranscript(), resolveAttachment };
@@ -186,8 +211,8 @@ describe("openai tool budget (real request body)", () => {
 		const last = [...messages].reverse().find((m) => (m.tool_calls ?? []).length > 0)!;
 		expect(last.tool_calls[0].function.arguments.length).toBeGreaterThan(25_000);
 
-		// Old results were replaced by the placeholder.
-		expect(raw).toContain("[Old tool result content cleared]");
+		// Old results were replaced by a tombstone naming the tool and path.
+		expect(raw).toContain("[Old tool result cleared: write t0.ts");
 	});
 
 	it("leaves a short transcript untouched", async () => {
@@ -232,6 +257,6 @@ describe("anthropic tool budget (real request body)", () => {
 		}
 		expect(useIds).toHaveLength(40);
 		expect(resultIds).toEqual(useIds);
-		expect(raw).toContain("[Old tool result content cleared]");
+		expect(raw).toContain("[Old tool result cleared: write t0.ts");
 	});
 });

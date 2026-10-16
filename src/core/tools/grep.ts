@@ -1,6 +1,7 @@
 import { readdir, readFile, stat } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { z } from "zod";
+import { canonicalize, contains } from "../permission.ts";
 import type { AgentTool } from "../types.ts";
 
 export const IGNORED_DIRS = new Set([
@@ -55,11 +56,19 @@ export function createGrepTool(cwd: string): AgentTool<typeof grepSchema> {
 		name: "grep",
 		label: "grep",
 		description:
-			"Search file contents for a regular expression pattern. Prefer this over shell findstr/grep: one call shows matches with surrounding context, so there is usually no need to re-read the same region. " +
+			`Search file contents for a regular expression pattern inside ${cwd}. Prefer this over shell findstr/grep: one call shows matches with surrounding context, so there is usually no need to re-read the same region. ` +
 			"Searches recursively, skipping node_modules/.git and large or binary files. Use glob to find files by name first.",
 		parameters: grepSchema,
 		async execute(call, { pattern, path, include, context, caseInsensitive }) {
-			const root = path ? (isAbsolute(path) ? path : resolve(cwd, path)) : cwd;
+			const rawRoot = path ? (isAbsolute(path) ? path : resolve(cwd, path)) : cwd;
+			const [rootCanonical, cwdCanonical] = await Promise.all([canonicalize(rawRoot), canonicalize(cwd)]);
+			if (!contains(cwdCanonical, rootCanonical)) {
+				return {
+					content: `搜索范围超出当前工作目录，已拒绝执行：${rawRoot} 不在 ${cwd} 内。请把 path 缩小到工作目录内，或先切换工作目录后再搜。`,
+					details: { root: rawRoot, cwd },
+				};
+			}
+			const root = rawRoot;
 			let regex: RegExp;
 			try {
 				regex = new RegExp(pattern, caseInsensitive ? "i" : "");

@@ -41,7 +41,7 @@ export function createReadTool(cwd: string): AgentTool<typeof readSchema> {
 		name: "read",
 		label: "read",
 		description:
-			"Read a text file. Returns the file content with line numbers. Optionally read only a slice of the file using offset and limit. Use limit to read the first N lines (instead of `head`), offset to skip ahead (instead of `tail`). Use glob to locate files by name before reading them.",
+			`Read a text file inside ${cwd}. Returns the file content with line numbers. Optionally read only a slice of the file using offset and limit. Use limit to read the first N lines (instead of \`head\`), offset to skip ahead (instead of \`tail\`). Prefer one larger read over many small slices, and use grep to find specific content in a large file instead of reading it whole. Use glob to locate files by name before reading them. Do not read files through the shell (type, cat, Get-Content, node -e with fs.readFileSync).`,
 		parameters: readSchema,
 		async execute(_ctx, { path, offset, limit }) {
 			const absolute = resolvePath(cwd, path);

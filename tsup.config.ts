@@ -1,5 +1,6 @@
 import { defineConfig } from "tsup";
 import { copyFile, stat } from "node:fs/promises";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
 const ASSET_FILES = ["favicon.ico", "logo-2026.png"];
@@ -29,5 +30,10 @@ export default defineConfig({
 	splitting: false,
 	noExternal: ["zod", "zod-to-json-schema"],
 	banner: { js: "#!/usr/bin/env node" },
+	define: {
+		__TJU_VERSION__: JSON.stringify(
+			(JSON.parse(readFileSync(join(process.cwd(), "package.json"), "utf8")) as { version?: string }).version ?? "0.0.0-dev",
+		),
+	},
 	onSuccess: copyAssets,
 });

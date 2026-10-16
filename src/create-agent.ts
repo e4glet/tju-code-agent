@@ -5,11 +5,14 @@ import { createAllTools } from "./core/tools/index.ts";
 import { createAskUserTool, type AskUserRequest } from "./core/tools/ask.ts";
 import { createTodoTool } from "./core/tools/todo.ts";
 import { createSubAgentTool } from "./core/tools/subagent.ts";
-import { DEFAULT_SYSTEM_PROMPT, modelFromConfig, readProjectDocs, withProjectDocs, withWorkingDirectory, type RunConfig } from "./config.ts";
+import { DEFAULT_SYSTEM_PROMPT, BASE_SYSTEM_PROMPT, modelFromConfig, readProjectDocs, type RunConfig } from "./config.ts";
+import { EXPERIMENT, type ExperimentFlags } from "./experiment.ts";
 
 export interface CreateAgentOptions extends Pick<AgentOptions, "beforeToolCall" | "afterToolCall"> {
 	config: RunConfig;
 	cwd: string;
+	/** Experiment flags (see `src/experiment.ts`). Defaults to the process-wide mode. */
+	experiment?: ExperimentFlags;
 	systemPrompt?: string;
 	tools?: ReturnType<typeof createAllTools>;
 	/** Shared todo list holder. When omitted a fresh one is created for the agent. */
@@ -44,15 +47,18 @@ function securityHintAfterToolCall(
 /** Build a ready-to-use {@link Agent} bound to a working directory. */
 export function createAgent(options: CreateAgentOptions): Agent {
 	const { config, cwd } = options;
+	const experiment = options.experiment ?? EXPERIMENT;
 	const todoStore: TodoStore = options.todoStore ?? { todos: [] };
 	const agentModel = modelFromConfig(config);
 	const docs = readProjectDocs(cwd);
 	const agent = new Agent({
 		model: agentModel,
-		systemPrompt: withWorkingDirectory(
-			withProjectDocs(options.systemPrompt ?? DEFAULT_SYSTEM_PROMPT, docs),
+		experiment,
+		promptSections: {
+			base: options.systemPrompt ?? (experiment.delegate ? DEFAULT_SYSTEM_PROMPT : BASE_SYSTEM_PROMPT),
 			cwd,
-		),
+			docs,
+		},
 		tools: [],
 		apiKey: config.apiKey,
 		provider: { model: agentModel, apiKey: config.apiKey, entryId: config.providerEntryId },
@@ -69,11 +75,13 @@ export function createAgent(options: CreateAgentOptions): Agent {
 		buildAgentTools(agent, {
 			cwd,
 			maxTokens: config.maxTokens,
+			allowPrivateFetch: config.allowPrivateFetch,
 			tools: options.tools,
 			todoStore,
 			beforeToolCall: options.beforeToolCall,
 			afterToolCall: options.afterToolCall,
 			askUser: options.askUser,
+			experiment,
 		}),
 	);
 	return agent;
@@ -83,23 +91,27 @@ export interface AgentToolchainDeps {
 	cwd: string;
 	maxTokens?: number;
 	tools?: AgentTool[];
+	/** Operator opt-in for fetch to private addresses (see RunConfig). */
+	allowPrivateFetch?: boolean;
 	todoStore: TodoStore;
 	beforeToolCall?: AgentOptions["beforeToolCall"];
 	afterToolCall?: AgentOptions["afterToolCall"];
 	askUser?: (request: AskUserRequest, signal?: AbortSignal) => Promise<string>;
+	experiment?: ExperimentFlags;
 }
 
 export function buildAgentTools(agent: Agent, deps: AgentToolchainDeps): AgentTool[] {
-	const base = deps.tools ?? createAllTools(deps.cwd);
+	const toolset = deps.tools ?? createAllTools(deps.cwd, { allowPrivateFetch: deps.allowPrivateFetch });
 	const afterToolCall = securityHintAfterToolCall(deps.afterToolCall);
 	return [
-		...base,
+		...toolset,
 		createTodoTool(deps.todoStore) as unknown as AgentTool,
 		createSubAgentTool({
 			cwd: deps.cwd,
 			provider: agent.provider,
 			maxTokens: deps.maxTokens,
-			tools: base,
+			tools: toolset,
+			exploreEnabled: (deps.experiment ?? EXPERIMENT).delegate,
 			beforeToolCall: deps.beforeToolCall,
 			afterToolCall,
 		}) as unknown as AgentTool,

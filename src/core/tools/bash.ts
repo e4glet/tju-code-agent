@@ -13,7 +13,7 @@ export const bashSchema = z.object({
 		.int()
 		.positive()
 		.optional()
-		.describe("Optional timeout in seconds. No timeout when omitted."),
+		.describe("Optional timeout in seconds. Defaults to 120, capped at 900."),
 	workdir: z
 		.string()
 		.optional()
@@ -219,11 +219,13 @@ export function windowsCommandHint(exitCode: number | null, output: string, comm
 }
 
 /** Remove old truncated-output temp dirs so they do not accumulate forever. */
+const TEMP_DIR_PREFIXES = ["tju-code-bash-", "tju-code-cmd-"];
+
 async function cleanStaleTempDirs(): Promise<void> {
 	const dirs = await readdir(tmpdir(), { withFileTypes: true }).catch(() => []);
 	const now = Date.now();
 	for (const entry of dirs) {
-		if (!entry.isDirectory() || !entry.name.startsWith("tju-code-bash-")) continue;
+		if (!entry.isDirectory() || !TEMP_DIR_PREFIXES.some((prefix) => entry.name.startsWith(prefix))) continue;
 		const full = join(tmpdir(), entry.name);
 		const info = await stat(full).catch(() => null);
 		if (info && now - info.mtimeMs > TRUNCATED_DIR_TTL_MS) {
@@ -235,6 +237,13 @@ async function cleanStaleTempDirs(): Promise<void> {
 function resolveWorkdir(base: string, workdir?: string): string {
 	const target = workdir ?? ".";
 	return isAbsolute(target) ? target : resolve(base, target);
+}
+
+export const DEFAULT_TIMEOUT_SECS = 120;
+export const MAX_TIMEOUT_SECS = 900;
+
+export function effectiveTimeoutSecs(timeout?: number): number {
+	return Math.min(timeout ?? DEFAULT_TIMEOUT_SECS, MAX_TIMEOUT_SECS);
 }
 
 const PAGER_PIPE = /\|\s*(more|less|most)(\s|$|[./])/i;
@@ -276,14 +285,14 @@ function shellSpec(shell?: string): { executable: string; args: (command: string
 	return { executable, args: (command) => ["-c", command] };
 }
 
-async function prepareWindowsInvocation(command: string): Promise<{ executable: string; args: string[] }> {
+async function prepareWindowsInvocation(command: string): Promise<{ executable: string; args: string[]; tempDir: string }> {
 	const executable = process.env.ComSpec ?? "cmd.exe";
 	const tempDir = await mkdtemp(join(tmpdir(), "tju-code-cmd-"));
 	const script = join(tempDir, "run.bat");
 	const normalized = collapseQuotedNewlines(requoteSingles(command));
 	const body = `@echo off\r\nchcp 65001 >nul\r\n${doubleLoopVariables(normalized)}\r\nexit /b %errorlevel%\r\n`;
 	await writeFile(script, body, "utf-8");
-	return { executable, args: ["/d", "/c", script] };
+	return { executable, args: ["/d", "/c", script], tempDir };
 }
 
 export function createBashTool(cwd: string, options: BashToolOptions = {}): AgentTool<typeof bashSchema> {
@@ -298,7 +307,8 @@ export function createBashTool(cwd: string, options: BashToolOptions = {}): Agen
 			(isWindows
 				? "On Windows this runs cmd.exe, so use Windows syntax (mkdir, not mkdir -p). Never pipe into Unix tools (head/tail/grep/cat/ls/find): use the glob tool to list files (capped at 100 matches), the grep tool to search contents, and the read tool with offset/limit to slice files. "
 				: "Prefer the glob/grep/read tools over shell pipes (cat/grep/head) for file lookup, search, and slicing. ") +
-			"Supports an optional timeout in seconds. Never use interactive commands or pagers (more, pause, bare python/node prompts).",
+			"Never read or search files from the shell (type, findstr, cat, Get-Content, node -e with fs.readFileSync): use the read tool for file contents and the grep tool for searching — shell output has no line numbers and cannot be re-used. " +
+			"Supports an optional timeout in seconds (default 120, max 900). Never use interactive commands or pagers (more, pause, bare python/node prompts).",
 		parameters: bashSchema,
 		async execute(call: ToolCallArgs, input: BashInput) {
 			const interactive = matchInteractiveCommand(input.command);
@@ -313,9 +323,10 @@ export function createBashTool(cwd: string, options: BashToolOptions = {}): Agen
 					? input.workdir
 					: resolve(workdir, input.workdir)
 				: workdir;
-			const invocation = isWindows
+			const invocation: { executable: string; args: string[]; tempDir?: string } = isWindows
 				? await prepareWindowsInvocation(input.command)
 				: { executable, args: args(input.command) };
+			cleanStaleTempDirs().catch(() => {});
 			const child = spawn(invocation.executable, invocation.args, {
 				cwd: runDir,
 				env: {
@@ -352,30 +363,35 @@ export function createBashTool(cwd: string, options: BashToolOptions = {}): Agen
 			child.stdout?.on("data", onData);
 			child.stderr?.on("data", onData);
 
-			const { exitCode, timedOut } = await new Promise<{ exitCode: number | null; timedOut: boolean }>(
-				(resolveExec, reject) => {
-					let timer: NodeJS.Timeout | undefined;
-					const onAbort = () => killTree(child);
-					if (call.signal?.aborted) onAbort();
-					else call.signal?.addEventListener("abort", onAbort, { once: true });
-					if (input.timeout !== undefined) {
+			let exitCode: number | null;
+			let timedOut: boolean;
+			try {
+				({ exitCode, timedOut } = await new Promise<{ exitCode: number | null; timedOut: boolean }>(
+					(resolveExec, reject) => {
+						let timer: NodeJS.Timeout | undefined;
+						const onAbort = () => killTree(child);
+						if (call.signal?.aborted) onAbort();
+						else call.signal?.addEventListener("abort", onAbort, { once: true });
+						const timeoutSecs = effectiveTimeoutSecs(input.timeout);
 						timer = setTimeout(() => {
 							killTree(child);
 							resolveExec({ exitCode: null, timedOut: true });
-						}, input.timeout * 1000);
-					}
-					child.on("error", (err) => {
-						if (timer) clearTimeout(timer);
-						call.signal?.removeEventListener("abort", onAbort);
-						reject(err);
-					});
-					child.on("close", (code) => {
-						if (timer) clearTimeout(timer);
-						call.signal?.removeEventListener("abort", onAbort);
-						resolveExec({ exitCode: code, timedOut: false });
-					});
-				},
-			);
+						}, timeoutSecs * 1000);
+						child.on("error", (err) => {
+							if (timer) clearTimeout(timer);
+							call.signal?.removeEventListener("abort", onAbort);
+							reject(err);
+						});
+						child.on("close", (code) => {
+							if (timer) clearTimeout(timer);
+							call.signal?.removeEventListener("abort", onAbort);
+							resolveExec({ exitCode: code, timedOut: false });
+						});
+					},
+				));
+			} finally {
+				if (invocation.tempDir) await rm(invocation.tempDir, { recursive: true, force: true }).catch(() => {});
+			}
 
 			captured += decoder.end();
 			const output = captured.trim() || "(no output)";
@@ -385,7 +401,7 @@ export function createBashTool(cwd: string, options: BashToolOptions = {}): Agen
 				throw new Error("Command aborted");
 			}
 			if (timedOut) {
-				throw new Error(`${header}\nCommand timed out after ${input.timeout ?? 0} seconds.\n${errBody}`);
+				throw new Error(`${header}\nCommand timed out after ${effectiveTimeoutSecs(input.timeout)} seconds.\n${errBody}`);
 			}
 			if (exitCode !== 0 && isFatalExit(exitCode, output, isWindows)) {
 				const hint = isWindows ? windowsCommandHint(exitCode, output, input.command) : null;

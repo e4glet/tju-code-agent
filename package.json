@@ -1,6 +1,6 @@
 {
 	"name": "tju-code",
-	"version": "0.1.15.3",
+	"version": "0.1.15.9",
 	"private": true,
 	"description": "A coding agent framework with a terminal CLI and an in-browser GUI: unified provider layer, streaming tool loop, and a local security boundary.",
 	"type": "module",

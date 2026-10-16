@@ -1,6 +1,8 @@
 import { runAgentLoop } from "./agent-loop.ts";
-import { compactTranscript } from "./context.ts";
+import { CHECKPOINT_PREFIX, compactTranscript, lastCompactionMarker } from "./context.ts";
 import { createSelfCorrection } from "./self-correct.ts";
+import { basePromptOf, composeSystemPrompt, type PromptSections } from "../config.ts";
+import { EXPERIMENT, type ExperimentFlags } from "../experiment.ts";
 import type {
 	AgentContext,
 	AgentEvent,
@@ -22,6 +24,16 @@ import type {
 export interface AgentOptions {
 	model: Model;
 	systemPrompt?: string;
+	/**
+	 * Base sections for the system prompt. When set, the prompt is (re)composed
+	 * via composeSystemPrompt() for the current model, so a model switch swaps the
+	 * model overlay automatically. Leave unset for a fully caller-owned prompt.
+	 * When both this and `systemPrompt` are set, `systemPrompt` wins and the
+	 * sections stay dormant until {@link Agent.setPromptSections} is called.
+	 */
+	promptSections?: Omit<PromptSections, "modelId">;
+	/** Experiment flags (see `src/experiment.ts`). Defaults to the process-wide mode. */
+	experiment?: ExperimentFlags;
 	/** Optional explicit tools to provide. Defaults to the bundled coding tools. */
 	tools?: AgentTool[];
 	apiKey?: string;
@@ -33,7 +45,13 @@ export interface AgentOptions {
 	maxImageBytes?: number;
 	/** Maximum assistant turns per run before the loop forces a final summary turn. */
 	maxTurns?: number;
-	/** Shared todo list holder; its contents are injected into the request context each turn. */
+	/**
+	 * Opt-in physical pruning: when set, the folded region before the compaction
+	 * marker keeps at most this many messages (the marker and the live region are
+	 * never touched). Undefined disables pruning (the default).
+	 */
+	pruneFoldedKeep?: number;
+	/** Shared todo list holder; consulted for turn-budget renewal, not injected into context. */
 	todoStore?: TodoStore;
 	/** Resolver that turns a user-message attachment reference into its bytes. */
 	resolveAttachment?: (attachment: Attachment) => Promise<Uint8Array | null>;
@@ -66,14 +84,43 @@ export type AgentListener = (event: AgentEvent, signal?: AbortSignal) => Promise
 /** Per-run cap for ask_user questions; waiting for an answer never consumes turns. */
 const MAX_ASKS_PER_RUN = 1;
 
+/** Keep an anchor line short enough that re-sending it every turn stays cheap. */
+function clipText(text: string, max: number): string {
+	return text.length <= max ? text : `${text.slice(0, max)}…`;
+}
+
 /**
  * Stateful coding agent wrapping the low-level loop.
  *
  * Owns the transcript, emits lifecycle events through {@link subscribe},
  * supports abort/cancel, and queues "steer" messages that are injected mid-run.
  */
+/**
+ * Build the standing goal anchor sent with each request: the original user
+ * request plus any open plan items. Ephemeral by construction (the loop passes
+ * it as a trailing instruction); nothing here is written to the transcript.
+ */
+export function buildPlanAnchor(messages: Message[], todos: Todo[]): string | undefined {
+	const firstUser = messages.find(
+		(m): m is UserMessage =>
+			m.role === "user" && !m.compaction && !m.steering && typeof m.content === "string" && m.content.trim().length > 0,
+	);
+	const open = todos.filter((t) => t.status !== "completed");
+	if (!firstUser && open.length === 0) return undefined;
+	const lines = ["<system-reminder>", "This restates the standing objective; it is not a new request."];
+	if (firstUser) lines.push(`Objective: ${clipText(firstUser.content.replace(/\s+/g, " ").trim(), 300)}`);
+	if (open.length > 0) {
+		lines.push(`Open plan items (${open.length}):`);
+		for (const t of open.slice(0, 6)) lines.push(`- [${t.status}] ${clipText(t.content.replace(/\s+/g, " ").trim(), 80)}`);
+		if (open.length > 6) lines.push(`- …and ${open.length - 6} more`);
+	}
+	lines.push("</system-reminder>");
+	return lines.join("\n");
+}
+
 export class Agent {
 	private systemPrompt: string;
+	private promptSections?: Omit<PromptSections, "modelId">;
 	/**
 	 * The agent's live interface state. Exposed read-only so tool factories can
 	 * share it; replace it through {@link Agent.setModel} / {@link Agent.setProvider}.
@@ -89,10 +136,12 @@ export class Agent {
 	private maxContextTokens?: number;
 	private maxImageBytes?: number;
 	private maxTurns?: number;
+	private pruneFoldedKeep?: number;
 	private askCountThisRun = 0;
 	private beforeToolCall?: AgentOptions["beforeToolCall"];
 	private afterToolCall?: AgentOptions["afterToolCall"];
 	private afterTurn?: AgentLoopConfig["afterTurn"];
+	private readonly experiment: ExperimentFlags;
 	private todoStore?: TodoStore;
 	private resolveAttachment?: (attachment: Attachment) => Promise<Uint8Array | null>;
 
@@ -110,11 +159,15 @@ export class Agent {
 		this.maxContextTokens = options.maxContextTokens;
 		this.maxImageBytes = options.maxImageBytes;
 		this.maxTurns = options.maxTurns;
+		this.pruneFoldedKeep = options.pruneFoldedKeep;
 		this.todoStore = options.todoStore;
 		this.beforeToolCall = options.beforeToolCall;
 		this.afterToolCall = options.afterToolCall;
 		this.afterTurn = options.afterTurn;
+		this.experiment = options.experiment ?? EXPERIMENT;
 		this.resolveAttachment = options.resolveAttachment;
+		this.promptSections = options.promptSections;
+		if (options.promptSections && !options.systemPrompt) this.recomposeSystemPrompt();
 	}
 
 	/** Current agent state snapshot. */
@@ -133,6 +186,12 @@ export class Agent {
 	/** Set the model for subsequent turns. */
 	setModel(model: Model): void {
 		this.provider.model = model;
+		this.recomposeSystemPrompt();
+	}
+
+	/** Enable/disable opt-in physical pruning of the folded history (undefined = off). */
+	setPruneFoldedKeep(keep: number | undefined): void {
+		this.pruneFoldedKeep = keep && keep > 0 ? Math.floor(keep) : undefined;
 	}
 
 	/**
@@ -144,6 +203,7 @@ export class Agent {
 		this.provider.model = next.model;
 		this.provider.apiKey = next.apiKey;
 		this.provider.entryId = next.entryId;
+		this.recomposeSystemPrompt();
 	}
 
 	/** Replace the tool set for subsequent turns. */
@@ -159,6 +219,25 @@ export class Agent {
 			throw new Error("Cannot replace the system prompt while streaming. Wait for the run to finish first.");
 		}
 		this.systemPrompt = prompt;
+	}
+
+	/**
+	 * Install/replace the base sections and recompose the prompt for the current
+	 * model. Safe while streaming: the running turn keeps its snapshot, the next
+	 * run picks up the new prompt.
+	 */
+	setPromptSections(sections: Omit<PromptSections, "modelId">): void {
+		this.promptSections = sections;
+		this.recomposeSystemPrompt();
+	}
+
+	get promptBase(): string {
+		return this.promptSections?.base ?? basePromptOf(this.systemPrompt);
+	}
+
+	private recomposeSystemPrompt(): void {
+		if (!this.promptSections) return;
+		this.systemPrompt = composeSystemPrompt({ ...this.promptSections, modelId: this.provider.model.id });
 	}
 
 	setBeforeToolCall(hook: AgentOptions["beforeToolCall"]): void {
@@ -257,7 +336,11 @@ export class Agent {
 		if (this.isStreaming) {
 			throw new Error("Cannot restore while streaming. Wait for the run to finish first.");
 		}
-		this.messages = state.messages.slice();
+		this.messages = state.messages.map((message) =>
+			message.role === "user" && !message.compaction && message.content.startsWith(CHECKPOINT_PREFIX)
+				? { ...message, compaction: true }
+				: message,
+		);
 		if (state.todos && this.todoStore) {
 			this.todoStore.todos = state.todos.slice();
 		}
@@ -324,8 +407,19 @@ export class Agent {
 			// loop may extend its own budget a bounded number of times. Read lazily
 			// so it always reflects the model's latest todowrite state.
 			hasPendingWork: () => this.todoStore?.todos.some((t) => t.status !== "completed") ?? false,
-			afterTurn: this.afterTurn ?? createSelfCorrection(),
+			afterTurn: this.afterTurn ?? createSelfCorrection({
+				refreshBudgetPerWindow: this.experiment.anchor,
+				getPlanState: () => {
+					const todos = this.todoStore?.todos ?? [];
+					return {
+						open: todos.filter((t) => t.status !== "completed").length,
+						active: todos.filter((t) => t.status === "active").length,
+					};
+				},
+			}),
+			getPlanAnchor: () => (this.experiment.anchor ? buildPlanAnchor(this.messages, this.todoStore?.todos ?? []) : undefined),
 			transformContext: async (messages, signal, options) => {
+				const markerBefore = lastCompactionMarker(messages);
 				const result = await compactTranscript(messages, {
 					model: this.provider.model,
 					apiKey: this.provider.apiKey,
@@ -334,9 +428,17 @@ export class Agent {
 					tools: this.tools,
 					maxContextTokens: this.maxContextTokens,
 					force: options?.force,
+					pruneFoldedKeep: this.pruneFoldedKeep,
 					signal,
 				});
+				// compactTranscript inserts/moves the marker inside `messages` in
+				// place; mirror the full transcript (never the compacted view) so the
+				// persisted state and the UI keep the complete history.
 				if (result) this.messages = messages.slice();
+				const markerAfter = lastCompactionMarker(messages);
+				if (markerAfter && markerAfter !== markerBefore) {
+					await this.dispatch({ type: "compaction", message: markerAfter });
+				}
 				return result ?? messages;
 			},
 			getSteeringMessages: async () => this.steeringQueue.splice(0),

@@ -52,12 +52,33 @@ type AgentPrompt = Message | string;
 const DEFAULT_MAX_TURNS = 50;
 
 /**
- * True for the step-cap instruction left in the transcript by older versions,
- * which pushed it as a real user message (see the cap branch in runLoop).
+ * Exact openings of the self-correction nudges that older versions persisted as
+ * real user messages (before they moved to the ephemeral channel). Matching the
+ * known prefixes — rather than any "[system] ..." — keeps a user who genuinely
+ * typed that text from losing their message.
  */
-function isLegacyTurnCapNotice(content: unknown): boolean {
-	return typeof content === "string" && content.trimStart().startsWith(TURN_CAP_MARKER);
+const LEGACY_CORRECTION_PREFIXES = [
+	"[system] You are repeating the same tool call",
+	"[system] Your previous turn was empty.",
+	"[system] You have read ",
+	"[system] You have open todo items",
+	"[system] Your plan still shows in-progress items",
+];
+
+/**
+ * True for a synthetic instruction left in the transcript by older versions.
+ * The step-cap instruction and the self-correction nudges were both pushed as
+ * real user messages, so they persist in existing work items and would be
+ * replayed on every later request: a stray "do not call tools" standing order
+ * and pseudo user turns that read as the user's latest instruction.
+ */
+export function isLegacyInjectedNotice(content: unknown): boolean {
+	if (typeof content !== "string") return false;
+	const text = content.trimStart();
+	if (text.startsWith(TURN_CAP_MARKER)) return true;
+	return LEGACY_CORRECTION_PREFIXES.some((prefix) => text.startsWith(prefix));
 }
+
 /** Extra turns granted when the plan still has open items. */
 const TURN_RENEWAL_SIZE = 25;
 /** Hard ceiling on renewals, so an unfinished plan can never loop forever. */
@@ -124,6 +145,25 @@ async function runLoop(
 	let maxTurns = config.maxTurns ?? DEFAULT_MAX_TURNS;
 	let renewals = 0;
 	let turnCount = 0;
+	// A self-correction returned by `afterTurn` is delivered to the next request
+	// as an ephemeral trailing instruction (see the correction branch below and
+	// streamAssistantResponse) instead of a real user message: it is a one-turn
+	// nudge, so it must not persist in the transcript, the work item, the run log
+	// or replay, and must not survive compaction as a pseudo user turn.
+	let pendingInstruction: string | undefined;
+	// Standing goal anchor (objective + open plan items), also ephemeral: it is
+	// re-derived every turn so long runs keep the objective in view without the
+	// transcript or the run log ever carrying a synthetic user turn.
+	const ephemeralInstruction = (): string | undefined => {
+		let anchor: string | undefined;
+		try {
+			anchor = config.getPlanAnchor?.();
+		} catch {
+			anchor = undefined;
+		}
+		const parts = [pendingInstruction, anchor].filter((part): part is string => !!part && part.length > 0);
+		return parts.length > 0 ? parts.join("\n\n") : undefined;
+	};
 	const hasOpenWork = (): boolean => {
 		try {
 			return config.hasPendingWork?.() === true;
@@ -189,7 +229,8 @@ async function runLoop(
 			}
 		}
 
-		const message = await streamAssistantResponse(context, config, signal, emit);
+		const message = await streamAssistantResponse(context, config, signal, emit, false, ephemeralInstruction());
+		pendingInstruction = undefined;
 		newMessages.push(message);
 
 		if (message.stopReason === "error" || message.stopReason === "aborted") {
@@ -221,9 +262,13 @@ async function runLoop(
 
 		await emit({ type: "turn_end", message, toolResults });
 
-		// Self-correction: let the hook inspect the turn and inject a corrective
-		// user message (repeated actions / empty turns) to keep the agent focused
-		// on the user's task. Only runs when the hook returns a message.
+		// Self-correction: let the hook inspect the turn and hand back a one-turn
+		// nudge (repeated actions / empty turns / stale plan). It rides the next
+		// request as an ephemeral trailing instruction rather than a real user
+		// message, so it never enters the transcript, the work item, the run log or
+		// replay — and compaction can never keep it around as a pseudo user turn
+		// that the model might mistake for the user's latest instruction. The user
+		// still sees that a correction happened, through a notice.
 		let correction: string | null = null;
 		try {
 			correction = (await config.afterTurn?.({ message, toolCalls, toolResults, turnCount })) ?? null;
@@ -231,15 +276,8 @@ async function runLoop(
 			correction = null;
 		}
 		if (correction) {
-			const correctionMessage: UserMessage = {
-				role: "user",
-				content: correction,
-				timestamp: Date.now(),
-			};
-			context.messages.push(correctionMessage);
-			newMessages.push(correctionMessage);
-			await emit({ type: "message_start", message: correctionMessage });
-			await emit({ type: "message_end", message: correctionMessage });
+			pendingInstruction = correction;
+			await emit({ type: "notice", level: "warn", message: `自我纠偏：${correction.replace(/^\[system\]\s*/i, "")}` });
 			continue;
 		}
 
@@ -302,14 +340,15 @@ async function streamAssistantResponse(
 			}
 		}
 
-		// Older versions pushed the step-cap instruction into the transcript as a
-		// real user message, so it is persisted in existing work items and would
-		// otherwise be replayed on every later request as a standing "do not call
-		// tools" instruction. Drop it on the way out (the stored transcript is left
-		// untouched) and keep the original array identity when there is nothing to
-		// strip, so the provider prefix cache stays stable.
-		const transcript = messages.some((m) => m.role === "user" && isLegacyTurnCapNotice(m.content))
-			? messages.filter((m) => !(m.role === "user" && isLegacyTurnCapNotice(m.content)))
+		// Older versions pushed the step-cap instruction and the self-correction
+		// nudges into the transcript as real user messages, so they are persisted in
+		// existing work items and would otherwise be replayed on every later request
+		// as a standing "do not call tools" order plus pseudo user turns that read as
+		// the user's latest instruction. Drop them on the way out (the stored
+		// transcript is left untouched) and keep the original array identity when
+		// there is nothing to strip, so the provider prefix cache stays stable.
+		const transcript = messages.some((m) => m.role === "user" && isLegacyInjectedNotice(m.content))
+			? messages.filter((m) => !(m.role === "user" && isLegacyInjectedNotice(m.content)))
 			: messages;
 
 		// An ephemeral instruction is appended *after* context transformation and
@@ -359,11 +398,11 @@ async function streamAssistantResponse(
 					break;
 				case "thinking_delta":
 					thinking += event.delta;
-					await emitDelta(partial, context, emit, text, thinking, event.delta);
+					await emitDelta(partial, context, emit, text, thinking, event.delta, "thinking");
 					break;
 				case "text_delta":
 					text += event.delta;
-					await emitDelta(partial, context, emit, text, thinking, event.delta);
+					await emitDelta(partial, context, emit, text, thinking, event.delta, "text");
 					break;
 				case "done":
 				case "error":
@@ -385,7 +424,10 @@ async function streamAssistantResponse(
 				stopReason: "error",
 				errorMessage: "Stream ended without a final message",
 				timestamp: Date.now(),
+				reasoningEffort: config.model.reasoningEffort,
 			};
+		} else if (final.reasoningEffort === undefined) {
+			final.reasoningEffort = config.model.reasoningEffort;
 		}
 
 		// Context-overflow recovery: when the provider rejected the request for
@@ -418,6 +460,7 @@ function createPartialAssistant(cfg: AgentLoopConfig): AssistantMessage {
 		usage: { input: 0, output: 0, totalTokens: 0 },
 		stopReason: "stop",
 		timestamp: Date.now(),
+		reasoningEffort: cfg.model.reasoningEffort,
 	};
 }
 
@@ -428,6 +471,7 @@ async function emitDelta(
 	text: string,
 	thinking: string,
 	delta: string,
+	part: "thinking" | "text",
 ): Promise<void> {
 	if (!partial) return;
 	const content: AssistantMessage["content"] = [];
@@ -438,9 +482,11 @@ async function emitDelta(
 		content.push({ type: "text", text });
 	}
 	if (content.length === 0 && !delta) return;
+	// The in-memory transcript partial stays complete; only the emitted event is
+	// thinned to the delta so the wire, the run log and replay stay linear.
 	partial.content = content as never;
 	context.messages[context.messages.length - 1] = partial;
-	await emit({ type: "message_update", message: { ...partial }, delta });
+	await emit({ type: "message_update", delta, part, messageId: partial.timestamp });
 }
 
 async function executeToolCalls(

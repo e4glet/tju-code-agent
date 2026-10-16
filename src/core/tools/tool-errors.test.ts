@@ -3,8 +3,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { applyPatchSchema } from "./apply-patch.ts";
-import { collapseQuotedNewlines, createBashTool, doubleLoopVariables, requoteSingles, windowsCommandHint } from "./bash.ts";
-import { createFetchTool, describeFetchError } from "./fetch.ts";
+import { collapseQuotedNewlines, createBashTool, doubleLoopVariables, effectiveTimeoutSecs, requoteSingles, windowsCommandHint } from "./bash.ts";
+import { createFetchTool, describeFetchError, fetchSchema } from "./fetch.ts";
 import { createGrepTool } from "./grep.ts";
 import { createScanTool } from "./scan.ts";
 import { fetchWithRetry } from "../../ai/utils.ts";
@@ -96,6 +96,20 @@ describe("bash error output", () => {
 			{ command: `node -e "process.stdout.write(process.cwd())"`, workdir: "sub" },
 		);
 		expect(result.content.replace(/\\/g, "/")).toContain(join(cwd, "sub").replace(/\\/g, "/"));
+	});
+
+	it("removes its windows staging dir instead of leaking it", async () => {
+		const before = new Set(readdirSync(tmpdir()).filter((name) => name.startsWith("tju-code-cmd-")));
+		const cwd = mkdtempSync(join(tmpdir(), "tju-bash-"));
+		dirs.push(cwd);
+		const tool = createBashTool(cwd);
+		const result = await tool.execute(
+			{ toolCallId: "t1", signal: undefined, onUpdate: () => {} },
+			{ command: "echo staged-ok" },
+		);
+		expect(result.content).toContain("staged-ok");
+		const leaked = readdirSync(tmpdir()).filter((name) => name.startsWith("tju-code-cmd-") && !before.has(name));
+		expect(leaked).toEqual([]);
 	});
 
 	it("forces utf-8 stdio for child processes", async () => {
@@ -298,20 +312,26 @@ describe("fetch error diagnostics", () => {
 		expect(message).toContain("https://nonexistent.invalid/");
 		expect(message.length).toBeGreaterThan("fetch failed".length);
 	});
-	it("never fetches loopback even with allowPrivate", async () => {
-		const tool = createFetchTool();
+	it("never fetches loopback even when the operator enabled private targets", async () => {
+		const tool = createFetchTool({ allowPrivate: true });
 		for (const url of ["http://127.0.0.1:9/", "http://localhost:9/"]) {
 			let message = "";
 			try {
 				await tool.execute(
 					{ toolCallId: "t1", signal: undefined, onUpdate: () => {} },
-					{ url, timeout: 10, allowPrivate: true },
+					{ url, timeout: 10 },
 				);
 			} catch (error) {
 				message = error instanceof Error ? error.message : String(error);
 			}
 			expect(message).toContain("loopback");
 		}
+	});
+
+	it("no longer lets the model grant itself private-address access", () => {
+		const parsed = fetchSchema.safeParse({ url: "http://10.0.0.1/", allowPrivate: true });
+		expect(parsed.success).toBe(true);
+		if (parsed.success) expect("allowPrivate" in parsed.data).toBe(false);
 	});
 });
 
@@ -403,6 +423,51 @@ describe("grep context", () => {
 		expect(res.content).toContain("Showing first 10 of");
 		expect(res.content).toContain("-4- pad 4");
 		expect(res.content).toContain("big.ts:360: HIT 360");
+	});
+
+	it("refuses search roots outside the working directory", async () => {
+		const cwd = mkdtempSync(join(tmpdir(), "tju-grep-"));
+		dirs.push(cwd);
+		const outside = mkdtempSync(join(tmpdir(), "tju-grep-out-"));
+		dirs.push(outside);
+		writeFileSync(join(cwd, "a.ts"), "TARGET here\n");
+		writeFileSync(join(outside, "b.ts"), "TARGET here\n");
+		const tool = createGrepTool(cwd);
+		const abs = await tool.execute(
+			{ toolCallId: "t1", signal: undefined, onUpdate: () => {} },
+			{ pattern: "TARGET", path: outside },
+		);
+		expect(abs.content).toContain("超出当前工作目录");
+		const rel = await tool.execute(
+			{ toolCallId: "t1", signal: undefined, onUpdate: () => {} },
+			{ pattern: "TARGET", path: ".." },
+		);
+		expect(rel.content).toContain("超出当前工作目录");
+		const inside = await tool.execute(
+			{ toolCallId: "t1", signal: undefined, onUpdate: () => {} },
+			{ pattern: "TARGET" },
+		);
+		expect(inside.content).toContain("a.ts:1: TARGET here");
+	});
+});
+
+describe("bash default timeout", () => {
+	it("defaults to 120s and caps at 900s", () => {
+		expect(effectiveTimeoutSecs(undefined)).toBe(120);
+		expect(effectiveTimeoutSecs(30)).toBe(30);
+		expect(effectiveTimeoutSecs(900)).toBe(900);
+		expect(effectiveTimeoutSecs(3600)).toBe(900);
+	});
+
+	it("still honours an explicit timeout without firing early", async () => {
+		const cwd = mkdtempSync(join(tmpdir(), "tju-bash-"));
+		dirs.push(cwd);
+		const tool = createBashTool(cwd);
+		const result = await tool.execute(
+			{ toolCallId: "t1", signal: undefined, onUpdate: () => {} },
+			{ command: `node -e "console.log('fast-ok')"`, timeout: 30 },
+		);
+		expect(result.content).toContain("fast-ok");
 	});
 });
 

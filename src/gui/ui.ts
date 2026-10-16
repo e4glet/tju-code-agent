@@ -3,7 +3,7 @@ export const VIEW_HTML = `<!DOCTYPE html>
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>Tju code GUI</title>
+<title>TJU Code GUI</title>
 <link rel="stylesheet" href="/style.css" />
 <link rel="icon" href="/favicon.ico" />
 <meta name="agent-token" content="__AGENT_TOKEN__" />
@@ -13,7 +13,7 @@ export const VIEW_HTML = `<!DOCTYPE html>
   <div class="drawer-backdrop" id="drawer-backdrop"></div>
   <aside class="sidebar">
     <div class="side-brand">
-      <span class="brand"><img class="brand-logo" src="/logo-2026.png" alt="logo" /><span>Tju code</span></span>
+      <span class="brand"><img class="brand-logo" src="/logo-2026.png" alt="logo" /><span>TJU Code</span></span>
       <button id="btn-theme" class="theme-btn" title="切换主题">深色</button>
     </div>
     <div class="panel-title">本轮</div>
@@ -62,7 +62,7 @@ export const VIEW_HTML = `<!DOCTYPE html>
         <div class="conv-inner" id="conv-inner">
           <div class="empty-card" id="empty-card">
             <img class="empty-logo" src="/logo-2026.png" alt="logo" />
-            <div class="empty-title">Tju code</div>
+            <div class="empty-title">TJU Code</div>
             <div class="empty-sub">自研 coding agent · 输入消息开始对话</div>
             <div class="empty-chips">
               <button class="chip" data-quick="请用 read 工具读取项目根目录下的 README.md 文件，并基于其内容介绍这个项目">项目概览</button>
@@ -187,10 +187,24 @@ export const VIEW_HTML = `<!DOCTYPE html>
           <label class="sound-opt" for="opt-sound-ask"><input type="checkbox" id="opt-sound-ask" class="settings-check" checked /> 提问与审批</label>
         </span>
       </div>
+      <label class="settings-row" for="opt-prune">
+        <span class="settings-label">
+          <span class="settings-name">历史裁剪</span>
+          <span class="settings-hint">开启后，已被压缩折叠的旧对话只保留最近若干条（更省磁盘；不裁剪则完整保留全部历史）。默认关闭。</span>
+        </span>
+        <input type="checkbox" id="opt-prune" class="settings-check" />
+      </label>
+      <div class="settings-row prune-sub disabled" id="prune-sub">
+        <span class="settings-label">
+          <span class="settings-name">裁剪保留条数</span>
+          <span class="settings-hint">已折叠的旧消息最多保留多少条（不含压缩摘要与最近对话）。条数越少越省磁盘，回看历史越少。</span>
+        </span>
+        <input type="number" id="opt-prune-n" class="prune-input" min="1" step="10" value="200" />
+      </div>
       <div class="settings-row">
         <span class="settings-label">
-          <span class="settings-name">当前接口 <span class="update-ver" id="provider-current">-</span></span>
-          <span class="settings-hint" id="provider-current-detail">加载中…</span>
+          <span class="settings-name">关于 <span class="update-ver">TJU Code</span></span>
+          <span class="settings-hint">天津大学系统安全与可信计算研究中心自研智能体编码工具</span>
         </span>
       </div>
     </div>
@@ -609,6 +623,18 @@ li { margin: 4px 0; }
 .thinking summary svg { color: var(--accent); flex-shrink: 0; }
 .thinking summary .caret { color: var(--faint); transition: transform .15s ease; }
 .thinking[open] summary .caret { transform: rotate(180deg); }
+/* Live reasoning: while the model is still thinking the row reads "思考中" and a
+   bubble on the right shows the tail of the reasoning stream (pet-style). */
+.thinking.thinking-live summary { width: 100%; }
+.think-label { white-space: nowrap; }
+.think-peek {
+  flex: 1 1 auto; margin-left: 8px; min-width: 0; max-width: none; padding: 2px 9px;
+  background: var(--accent-soft); border: 1px solid var(--border); border-radius: 10px;
+  color: var(--muted); font-size: 12px; line-height: 1.5;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; user-select: text;
+}
+.think-peek:empty { display: none; }
+.thinking.thinking-live[open] summary .think-peek { display: none; }
 .thinking .thinking-body {
   margin: 6px 0 2px; padding: 10px 12px;
   background: var(--code); border: 1px solid var(--border); border-radius: 10px;
@@ -983,6 +1009,15 @@ li { margin: 4px 0; }
 .sound-sub.disabled { opacity: .5; }
 .sound-opt { display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 500; color: var(--text); cursor: pointer; }
 .sound-opt .settings-check { margin-top: 0; }
+.prune-sub .settings-label { gap: 8px; }
+.prune-sub.disabled { opacity: .5; }
+.prune-input {
+  flex: none; width: 90px; margin-top: 2px; padding: 6px 10px;
+  border: 1px solid var(--border); border-radius: 8px; background: var(--panel);
+  color: var(--text); font-size: 13px;
+}
+.prune-input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.prune-sub.disabled .prune-input { cursor: not-allowed; }
 .update-ver {
   font-family: "SF Mono", "JetBrains Mono", "Fira Code", Consolas, monospace;
   font-size: 12px; color: var(--muted); font-weight: 500;
@@ -1234,7 +1269,7 @@ var currentRunId = null;
 var trajDetailOpen = null;
 var EMPTY_CARD = '<div class="empty-card">' +
   '<img class="empty-logo" src="/logo-2026.png" alt="logo" />' +
-  '<div class="empty-title">Tju code</div>' +
+  '<div class="empty-title">TJU Code</div>' +
   '<div class="empty-sub">自研 coding agent · 输入消息开始对话</div>' +
   '<div class="empty-chips">' +
   '<button class="chip" data-quick="请用 read 工具读取项目根目录下的 README.md 文件，并基于其内容介绍这个项目">项目概览</button>' +
@@ -1592,22 +1627,27 @@ function prettyModelName(id) {
   }
   return out.join(" ");
 }
-function effortLabel() {
-  var e = normalizeEffort(currentEffort) || "high";
-  if (e === "none") return "Off";
-  return e.charAt(0).toUpperCase() + e.slice(1);
+function formatEffortLabel(value) {
+  var n = normalizeEffort(value) || "high";
+  if (n === "none") return "Off";
+  return n.charAt(0).toUpperCase() + n.slice(1);
 }
-function appendAnswerFooter(b) {
+function effortLabel() {
+  return formatEffortLabel(currentEffort);
+}
+function appendAnswerFooter(b, modelId, effort) {
   if (!b || !b._copyBtn) return null;
   var foot = document.createElement("div");
   foot.className = "msg-footer";
+  foot._modelId = modelId || currentModelId;
+  foot._effort = effort || currentEffort;
   foot.appendChild(b._copyBtn);
   b._copyBtn = null;
   b.appendChild(foot);
   b._answerFooter = foot;
   return foot;
 }
-function setFooterMeta(foot, ms) {
+function setFooterMeta(foot, ms, modelId, effort) {
   if (!foot) return;
   var old = foot.querySelector(".msg-meta");
   if (old) old.remove();
@@ -1617,7 +1657,9 @@ function setFooterMeta(foot, ms) {
   meta.className = "msg-meta";
   var modelSpan = document.createElement("span");
   modelSpan.className = "model";
-  modelSpan.textContent = prettyModelName(currentModelId) + " (" + effortLabel() + ")";
+  var mid = modelId || foot._modelId || currentModelId;
+  var elabel = formatEffortLabel(effort || foot._effort || currentEffort);
+  modelSpan.textContent = prettyModelName(mid) + " (" + elabel + ")";
   var sep = document.createElement("span");
   sep.className = "sep";
   sep.textContent = "·";
@@ -1651,7 +1693,8 @@ function makeWorkspace(runEl) {
     turns: [],
     overviewRecords: [],
     overviewStart: 0,
-    emptyEl: null
+    emptyEl: null,
+    streamDelta: null
   };
 }
 function resetTrajectory(ws) {
@@ -2125,10 +2168,14 @@ function handleTrajEvent(ws, e) {
       break;
     case "message_start":
       if (e.message.role === "user") trajUserStart(ws, e.message);
-      else if (e.message.role === "assistant") trajMessageStart(ws, e.message);
+      else if (e.message.role === "assistant") {
+        ws.streamDelta = newStreamDelta(e.message);
+        trajMessageStart(ws, e.message);
+      }
       break;
     case "message_update":
-      trajMessageUpdate(ws, e.message);
+      if (!ws.streamDelta) ws.streamDelta = newStreamDelta(null);
+      trajMessageUpdate(ws, streamDeltaMessageFrom(applyStreamDeltaTo(ws.streamDelta, e)));
       break;
     case "message_end":
       trajMessageEnd(ws, e.message);
@@ -2306,6 +2353,13 @@ var THINKING_ICON = '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"
 
 var THINKING_CARET = '<svg class="caret" width="12" height="12" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M4 6L8 10L12 6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>';
 
+/** Tail of the streaming reasoning, for the live bubble shown next to "思考中". */
+function thinkingTail(text, max) {
+  var t = (text || "").replace(/\\s+/g, " ").trim();
+  if (!t) return "";
+  return t.length > max ? "…" + t.slice(t.length - max) : t;
+}
+
 function renderAssistant(msg) {
   var thinking = "";
   var text = "";
@@ -2330,6 +2384,47 @@ function renderAssistant(msg) {
 // default). Recorded by the delegated summary click so the choice survives the
 // high-frequency innerHTML rebuilds of the stream view.
 var streamThinkingOpen = null;
+
+// Streaming accumulation buffer. message_update carries only the new text per
+// frame (see AgentEvent), so the front end rebuilds the full message here and
+// keys it by message id. A frame that does carry a full message (the
+// end-of-stream replace, or a legacy run log replay) supersedes the buffer.
+// The live view and each historical-run rebuild keep separate buffers.
+var streamDelta = { id: null, thinking: "", text: "" };
+
+function newStreamDelta(msg) {
+  return { id: (msg && typeof msg.timestamp === "number") ? msg.timestamp : null, thinking: "", text: "" };
+}
+function resetStreamDelta(msg) { streamDelta = newStreamDelta(msg); }
+
+function applyStreamDeltaTo(buf, e) {
+  if (e.message) {
+    var parts = splitAssistantMessage(e.message);
+    buf.id = (typeof e.message.timestamp === "number") ? e.message.timestamp : buf.id;
+    buf.thinking = parts.thinking;
+    buf.text = parts.text;
+    return buf;
+  }
+  if (typeof e.messageId === "number" && buf.id !== null && e.messageId !== buf.id) {
+    buf.id = e.messageId;
+    buf.thinking = "";
+    buf.text = "";
+  } else if (buf.id === null && typeof e.messageId === "number") {
+    buf.id = e.messageId;
+  }
+  if (e.part === "thinking") buf.thinking += (e.delta || "");
+  else if (e.part === "text") buf.text += (e.delta || "");
+  return buf;
+}
+
+function streamDeltaMessageFrom(buf) {
+  var content = [];
+  if (buf.thinking) content.push({ type: "thinking", thinking: buf.thinking });
+  if (buf.text) content.push({ type: "text", text: buf.text });
+  return { role: "assistant", content: content };
+}
+
+function streamDeltaMessage() { return streamDeltaMessageFrom(streamDelta); }
 
 // Split an assistant message into its thinking text and answer text.
 function splitAssistantMessage(msg) {
@@ -2362,11 +2457,34 @@ function renderStreamBody(bd, msg) {
     if (!det) {
       det = document.createElement("details");
       det.className = "thinking";
-      det.innerHTML = "<summary>" + THINKING_ICON + "思考过程" + THINKING_CARET + "</summary><div class='thinking-body'></div>";
+      det.innerHTML =
+        "<summary>" +
+        THINKING_ICON +
+        "<span class='think-label'>思考过程</span>" +
+        THINKING_CARET +
+        "<span class='think-peek'></span>" +
+        "</summary><div class='thinking-body'></div>";
       bd.insertBefore(det, bd.firstChild);
     }
     var tb = det.querySelector(".thinking-body");
     if (tb && tb.textContent !== parts.thinking) tb.textContent = parts.thinking;
+    // While no answer text has arrived the model is still thinking: the row reads
+    // "思考中" and a bubble on the same row shows the live tail of the reasoning
+    // (pet-style). As soon as the answer starts, the row goes back to the usual
+    // "思考过程" toggle with the full reasoning inside (bug 2 of 0.1.15.6).
+    var stillThinking = !parts.text;
+    var label = det.querySelector(".think-label");
+    if (label) {
+      var nextLabel = stillThinking ? "思考中" : "思考过程";
+      if (label.textContent !== nextLabel) label.textContent = nextLabel;
+    }
+    if (stillThinking) det.classList.add("thinking-live");
+    else det.classList.remove("thinking-live");
+    var peek = det.querySelector(".think-peek");
+    if (peek) {
+      var tail = stillThinking ? thinkingTail(parts.thinking, 80) : "";
+      if (peek.textContent !== tail) peek.textContent = tail;
+    }
   } else if (det) {
     det.remove();
   }
@@ -2509,8 +2627,10 @@ function bubble(cls, textOrHtml, isHtml, attachments, ts) {
 // neutral notice instead of a fake user bubble, and stripped before the
 // conversation is persisted so a refresh cannot resurrect a stale one.
 function addNotice(text, level) {
-  var emptyEl = conversation.querySelector(".empty-card");
-  if (emptyEl) emptyEl.remove();
+  // A notice is UI-only state (it never enters the transcript and is stripped
+  // before saving), so it must NOT clear the empty-state card: doing that made
+  // the logo vanish right after "已新建工作项/已切换到工作项". Only real
+  // conversation content (message_start) hides the card.
   var el = document.createElement("div");
   el.className = "sys-notice" + (level === "warn" ? " warn" : "");
   el.textContent = String(text || "");
@@ -3133,10 +3253,34 @@ function handleLiveEvent(e) {
       saveTraj(liveWs);
       if (liveWs.metaEl) liveWs.metaEl.textContent = "已完成";
       clearSteerChips();
+      // Opt-in pruning physically drops old folded messages; if the DOM still
+      // shows a user bubble the transcript no longer has, its revert button
+      // would fail — rebuild the conversation from the transcript to drop them.
+      if (pruneEnabled && e.messages) {
+        var pruneLive = {};
+        for (var pti = 0; pti < e.messages.length; pti++) pruneLive[String(e.messages[pti].timestamp)] = true;
+        var pruneDom = convInner.querySelectorAll(".bubble.user");
+        var pruneStale = false;
+        for (var pdj = 0; pdj < pruneDom.length; pdj++) {
+          var pdts = pruneDom[pdj].getAttribute("data-ts");
+          if (pdts && !pruneLive[pdts]) { pruneStale = true; break; }
+        }
+        if (pruneStale) renderConversation(e.messages, true);
+      }
       loadRuns();
       break;
     case "notice":
       addNotice(e.message, e.level);
+      break;
+    case "compaction":
+      // Context compaction inserted/moved its marker. The block is rendered
+      // inline (old bubbles stay above, new ones continue below); on replay the
+      // marker renders from the transcript via renderConversation.
+      if (e.message && typeof e.message.content === "string") {
+        renderCheckpointBlock(e.message.content);
+        scheduleSave();
+        scrollDown();
+      }
       break;
     case "message_start": {
       var emptyEl = conversation.querySelector(".empty-card");
@@ -3144,6 +3288,7 @@ function handleLiveEvent(e) {
       if (e.message.role === "assistant") {
         cancelStreamRender();
         streamThinkingOpen = null;
+        resetStreamDelta(e.message);
         pendingAssistant = bubble("assistant", renderAssistant(e.message), true);
         trajMessageStart(liveWs, e.message);
       } else if (e.message.role === "user") {
@@ -3154,24 +3299,28 @@ function handleLiveEvent(e) {
       scheduleSave();
       break;
     }
-case "message_update":
-      if (pendingAssistant && e.message.role === "assistant") {
-        streamRenderMsg = e.message;
+case "message_update": {
+      applyStreamDeltaTo(streamDelta, e);
+      var accMsg = streamDeltaMessage();
+      if (pendingAssistant) {
+        streamRenderMsg = accMsg;
         scheduleStreamRender();
       }
-      trajMessageUpdate(liveWs, e.message);
+      trajMessageUpdate(liveWs, accMsg);
       scrollDown();
       break;
+    }
     case "message_end":
       if (pendingAssistant && e.message.role === "assistant") {
         cancelStreamRender();
         streamRenderMsg = null;
+        resetStreamDelta(null);
         var bodyEl = pendingAssistant.querySelector(".body");
         renderFinalBody(bodyEl, renderAssistant(e.message));
         var answerText = assistantAnswerText(e.message).trim();
         if (pendingAssistant._copyBtn && bodyEl && answerText) {
           pendingAssistant._answerText = answerText;
-          lastAnswerFooter = appendAnswerFooter(pendingAssistant);
+          lastAnswerFooter = appendAnswerFooter(pendingAssistant, e.message.model, e.message.reasoningEffort);
         }
       }
       scrollDown();
@@ -3485,6 +3634,46 @@ bindSoundOpt("opt-sound-err", "tju.gui.sound.err", function (v) { soundErr = v; 
 bindSoundOpt("opt-sound-ask", "tju.gui.sound.ask", function (v) { soundAsk = v; });
 applySoundMode();
 
+// ---- history pruning (opt-in; the fold-region cap is enforced server-side) ----
+var pruneEnabled = false;
+var pruneKeep = 200;
+try {
+  pruneEnabled = localStorage.getItem("tju.gui.prune") === "1";
+  var pn = parseInt(localStorage.getItem("tju.gui.pruneN") || "", 10);
+  if (pn > 0) pruneKeep = pn;
+} catch (e) {}
+var optPrune = document.getElementById("opt-prune");
+var optPruneN = document.getElementById("opt-prune-n");
+var pruneSub = document.getElementById("prune-sub");
+function applyPruneMode() {
+  if (optPrune) optPrune.checked = pruneEnabled;
+  if (optPruneN) { optPruneN.value = String(pruneKeep); optPruneN.disabled = !pruneEnabled; }
+  if (pruneSub) pruneSub.classList.toggle("disabled", !pruneEnabled);
+}
+function pushPruneSetting() {
+  fetch("/api/prune", {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-agent-token": AGENT_TOKEN },
+    body: JSON.stringify({ keep: pruneEnabled ? pruneKeep : 0 })
+  }).catch(function () {});
+}
+if (optPrune) optPrune.addEventListener("change", function () {
+  pruneEnabled = !!optPrune.checked;
+  try { localStorage.setItem("tju.gui.prune", pruneEnabled ? "1" : "0"); } catch (e) {}
+  applyPruneMode();
+  pushPruneSetting();
+});
+if (optPruneN) optPruneN.addEventListener("change", function () {
+  var v = parseInt(optPruneN.value, 10);
+  if (!(v > 0)) v = 200;
+  pruneKeep = v;
+  try { localStorage.setItem("tju.gui.pruneN", String(pruneKeep)); } catch (e) {}
+  applyPruneMode();
+  if (pruneEnabled) pushPruneSetting();
+});
+applyPruneMode();
+pushPruneSetting();
+
 // ---- settings tabs (通用 / 接口 / 更新) + self update ----
 var settingsTabGeneral = document.getElementById("settings-tab-general");
 var settingsTabUpdate = document.getElementById("settings-tab-update");
@@ -3690,8 +3879,6 @@ var providerFTest = document.getElementById("provider-f-test");
 var providerFSave = document.getElementById("provider-f-save");
 var providerFCancel = document.getElementById("provider-f-cancel");
 var btnProviderAdd = document.getElementById("btn-provider-add");
-var providerCurrentEl = document.getElementById("provider-current");
-var providerCurrentDetail = document.getElementById("provider-current-detail");
 var providerSelect = document.getElementById("provider-select");
 var providerApiBtns = document.querySelectorAll(".provider-api-btn");
 var providerState = { entries: [], current: { entryId: null, modelId: "" }, warnings: [] };
@@ -3777,19 +3964,6 @@ function buildProviderItem(item) {
   return row;
 }
 
-function renderProviderCurrent() {
-  var found = providerEntryById(providerState.current.entryId);
-  if (!found) {
-    providerCurrentEl.textContent = providerState.current.entryId || "未选择";
-    providerCurrentDetail.textContent = "未选择可用的接口，请到“接口”页添加";
-    return;
-  }
-  providerCurrentEl.textContent = found.label || found.id;
-  providerCurrentDetail.textContent = providerApiLabel(found.api) + " · " + (found.baseUrl || "-") + " · "
-    + (providerState.current.modelId || found.defaultModel)
-    + (found.hasKey ? "" : "（未配置 key，无法调用）");
-}
-
 function renderProviderSelect() {
   providerSelect.replaceChildren();
   if (!providerState.current.entryId) {
@@ -3833,7 +4007,6 @@ function renderProviders() {
   for (var i = 0; i < providerState.entries.length; i++) {
     providerListEl.appendChild(buildProviderItem(providerState.entries[i]));
   }
-  renderProviderCurrent();
   renderProviderSelect();
 }
 
@@ -4819,14 +4992,16 @@ function renderToolBlock(name, args, resultText, isError) {
   convInner.appendChild(el);
 }
 
-function renderConversation(messages) {
+function renderConversation(messages, keepTrajectory) {
   convInner.replaceChildren();
   navRender();
   var runTodoCard = null;
   if (todoDock) { todoDock.replaceChildren(); todoDock.hidden = true; }
   todoLiveCard = null;
-  try { localStorage.removeItem("tju.gui.conv"); localStorage.removeItem("tju.gui.traj"); } catch (e) {}
-  clearTrajectory();
+  if (!keepTrajectory) {
+    try { localStorage.removeItem("tju.gui.conv"); localStorage.removeItem("tju.gui.traj"); } catch (e) {}
+    clearTrajectory();
+  }
   if (!messages || !messages.length) {
     if (emptyCard) convInner.appendChild(emptyCard);
     else convInner.innerHTML = EMPTY_CARD;
@@ -4835,13 +5010,17 @@ function renderConversation(messages) {
   var segStart = null;
   var segEnd = null;
   var segFooter = null;
+  var segModel = null;
+  var segEffort = null;
   function finalizeSeg() {
     if (segFooter && segStart !== null && segEnd !== null && segEnd > segStart) {
-      setFooterMeta(segFooter, segEnd - segStart);
+      setFooterMeta(segFooter, segEnd - segStart, segModel, segEffort);
     }
     segFooter = null;
     segStart = null;
     segEnd = null;
+    segModel = null;
+    segEffort = null;
   }
   function touchSeg(ts) {
     if (typeof ts !== "number" || !ts) return;
@@ -4854,7 +5033,7 @@ function renderConversation(messages) {
     if (m.role === "user") {
       runTodoCard = null;
       var ucontent = typeof m.content === "string" ? m.content : "";
-      if (ucontent.indexOf("<conversation-checkpoint>") !== -1) {
+      if (m.compaction === true || ucontent.indexOf("<conversation-checkpoint>") !== -1) {
         renderCheckpointBlock(ucontent);
         continue;
       }
@@ -4883,7 +5062,9 @@ function renderConversation(messages) {
         var answerTrim = text.trim();
         if (b._copyBtn && answerTrim) {
           b._answerText = answerTrim;
-          segFooter = appendAnswerFooter(b);
+          segFooter = appendAnswerFooter(b, m.model, m.reasoningEffort);
+          segModel = m.model;
+          segEffort = m.reasoningEffort;
         }
       }
       var byId = {};
@@ -5210,11 +5391,18 @@ loadWorks();
  * x-agent-token like every other API call. Reconnection is done by hand with
  * exponential backoff.
  */
-var eventStreamController = new AbortController();
+var eventStreamController = null;
 var eventStreamClosed = false;
+// Reset on every frame (including the server's 15 s heartbeat), so a stalled or
+// half-open stream — laptop sleep, proxy silently dropping the socket — is
+// detected instead of hanging forever waiting on a read() that never settles.
+var eventStreamLastFrame = 0;
+var EVENT_STREAM_IDLE_MS = 45000;
 
 function connectEvents(attempt) {
   if (eventStreamClosed) return;
+  eventStreamController = new AbortController();
+  eventStreamLastFrame = Date.now();
   fetch("/api/events", { headers: { "x-agent-token": AGENT_TOKEN }, signal: eventStreamController.signal })
     .then(function (res) {
       if (!res.ok || !res.body) throw new Error("stream status " + res.status);
@@ -5225,6 +5413,7 @@ function connectEvents(attempt) {
       function read() {
         return reader.read().then(function (chunk) {
           if (chunk.done) throw new Error("stream ended");
+          eventStreamLastFrame = Date.now();
           buffer += decoder.decode(chunk.value, { stream: true });
           var frames = buffer.split("\\n\\n");
           buffer = frames.pop();
@@ -5250,6 +5439,17 @@ function connectEvents(attempt) {
     });
 }
 
+// Watchdog: if no frame (data or heartbeat) arrives within 3x the server
+// heartbeat, abort the stream so the reconnect path above runs and the fresh
+// connection's state frame re-syncs busy/idle — otherwise a dropped
+// agent_end would leave the UI stuck on "executing" until a manual refresh.
+setInterval(function () {
+  if (eventStreamClosed) return;
+  if (eventStreamController && Date.now() - eventStreamLastFrame > EVENT_STREAM_IDLE_MS) {
+    try { eventStreamController.abort(); } catch (e) {}
+  }
+}, 5000);
+
 var approvalBox = document.getElementById("approval");
 var approvalText = document.getElementById("approval-text");
 var approvalRequestId = null;
@@ -5262,15 +5462,20 @@ function showNextApproval() {
   var req = approvalQueue.shift();
   approvalRequestId = req.requestId;
   approvalParentDir = req.parentDir || null;
+  // Bug 3 of 0.1.15.6: name the command fragment that triggered the request, so a
+  // directory the user does not recognise as part of the current task can be traced
+  // back to the exact cd target / argument that asked for it.
+  var approvalWhy =
+    (req.via ? "\\n触发位置：" + req.via : "") + (req.workdir ? "\\n当前工作目录：" + req.workdir : "");
   if (approvalParentDir) {
     approvalParentBtn.hidden = false;
     approvalParentBtn.textContent = "总是允许 " + approvalParentDir + "\\*";
     approvalParentBtn.title = "本次会话内记住 " + approvalParentDir + " 及其所有子目录";
-    approvalText.textContent = "工具 " + req.toolName + " 将访问工作目录外的目录：\\n  " + req.scopeDir + "\\n『总是允许』记住该目录（含子目录）；上级记住 " + approvalParentDir + "\\*（含子目录）。";
+    approvalText.textContent = "工具 " + req.toolName + " 将访问工作目录外的目录：\\n  " + req.scopeDir + approvalWhy + "\\n『总是允许』记住该目录（含子目录）；上级记住 " + approvalParentDir + "\\*（含子目录）。";
   } else {
     approvalParentBtn.hidden = true;
     approvalParentDir = null;
-    approvalText.textContent = "工具 " + req.toolName + " 将访问工作目录外的目录：\\n  " + req.scopeDir + "\\n『总是允许』将在本次会话内记住该目录（含子目录）。";
+    approvalText.textContent = "工具 " + req.toolName + " 将访问工作目录外的目录：\\n  " + req.scopeDir + approvalWhy + "\\n『总是允许』将在本次会话内记住该目录（含子目录）。";
   }
   approvalBox.hidden = false;
 }

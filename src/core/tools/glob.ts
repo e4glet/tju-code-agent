@@ -2,6 +2,7 @@ import { readdir, stat } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { z } from "zod";
 import type { AgentTool } from "../types.ts";
+import { canonicalize, contains } from "../permission.ts";
 import { IGNORED_DIRS } from "./grep.ts";
 
 const MAX_MATCHES = 100;
@@ -38,10 +39,18 @@ export function createGlobTool(cwd: string): AgentTool<typeof globSchema> {
 		name: "glob",
 		label: "glob",
 		description:
-			"Find files by name pattern without reading them. Each match includes the file size in bytes, so use this to locate files and to check file sizes instead of shell for-loops. Use this instead of `dir /s /b ... | head` or `ls ... | head` pipelines: results are capped at 100 matches (enough for everyday projects) with a narrowing hint when truncated. Use grep to search inside file contents.",
+			`Find files by name pattern inside ${cwd} without reading them. Each match includes the file size in bytes, so use this to locate files and to check file sizes instead of shell for-loops. Use this instead of \`dir /s /b ... | head\` or \`ls ... | head\` pipelines: results are capped at 100 matches (enough for everyday projects) with a narrowing hint when truncated. Use grep to search inside file contents.`,
 		parameters: globSchema,
 		async execute(call, { pattern, path }) {
-			const root = path ? (isAbsolute(path) ? path : resolve(cwd, path)) : cwd;
+			const rawRoot = path ? (isAbsolute(path) ? path : resolve(cwd, path)) : cwd;
+			const [rootCanonical, cwdCanonical] = await Promise.all([canonicalize(rawRoot), canonicalize(cwd)]);
+			if (!contains(cwdCanonical, rootCanonical)) {
+				return {
+					content: `搜索范围超出当前工作目录，已拒绝执行：${rawRoot} 不在 ${cwd} 内。请把 path 缩小到工作目录内，或先切换工作目录后再搜。`,
+					details: { root: rawRoot, cwd },
+				};
+			}
+			const root = rawRoot;
 			const matchNameOnly = !pattern.includes("/");
 			const nameRegex = matchNameOnly ? globToPathRegex(pattern) : null;
 			const pathRegex = matchNameOnly ? null : globToPathRegex(pattern);

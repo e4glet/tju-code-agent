@@ -63,15 +63,15 @@ export function formatTodos(todos: Todo[]): string {
 
 /**
  * Session-scoped todo/plan tool. The current list lives in the shared
- * `store` and is also injected into the request context by the Agent, so the
- * model always sees the plan it is working on.
+ * `store` and is echoed back in the tool result; it is not injected into the
+ * request context, so the model only sees the plan when it (re)reads the list.
  */
 export function createTodoTool(store: TodoStore): AgentTool<typeof todoSchema> {
 	return {
 		name: "todowrite",
 		label: "todowrite",
 		description:
-			"Create and maintain a structured task list for the current coding session. Use it to track progress during multi-step work and keep todo statuses current. Pass the full updated list each time. Each item has content, a status (pending|active|completed) and an optional priority (low|medium|high).",
+			"Create and maintain a structured task list for the current coding session. Call this FIRST for non-trivial work — before editing files or running commands — to lay out the concrete steps, then keep each item's status current (pending -> active -> completed) as you work; it keeps the run anchored to the user's request and is shown to the user. Pass the full updated list each time. Each item has content, a status (pending|active|completed) and an optional priority (low|medium|high). Skip it for trivial single-step requests.",
 		parameters: todoSchema,
 		async execute(_call, { todos }) {
 			store.todos = todos.map((t) => ({
